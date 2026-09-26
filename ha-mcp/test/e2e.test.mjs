@@ -80,6 +80,10 @@ before(async () => {
             { name: "homeassistant.components.zha", message: ["Device offline"], level: "WARNING", source: ["zha.py", 10], timestamp: 1000, first_occurred: 900, count: 3, exception: "" },
             { name: "custom_components.foo", message: ["Setup failed"], level: "ERROR", source: ["foo.py", 5], timestamp: 2000, first_occurred: 2000, count: 1, exception: "Traceback..." },
           ] }));
+        } else if (msg.type === "render_template") {
+          // ha_render_template renders over the websocket (with a timeout): result, then an event.
+          ws.send(JSON.stringify({ id: msg.id, type: "result", success: true, result: null }));
+          ws.send(JSON.stringify({ id: msg.id, type: "event", event: { result: "rendered:" + msg.template, listeners: {} } }));
         } else {
           wsCommandsSeen.push(msg.type);
           ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { message: "unexpected" } }));

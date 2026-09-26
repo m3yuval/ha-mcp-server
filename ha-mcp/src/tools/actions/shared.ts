@@ -4,7 +4,7 @@
  * resulting states compactly.
  */
 import { z } from "zod";
-import { HAClient, HAError, type ServiceCallOptions } from "../../ha-client.js";
+import { HAClient, HAError, TARGET_KEYS, type ServiceCallOptions } from "../../ha-client.js";
 import type { HAState } from "../common.js";
 
 // ------------------------------------------------------------------ schemas
@@ -303,6 +303,22 @@ export async function report(ha: HAClient, calls: CallResult[], entityIdsToShow:
     if (uniq.length > 50) out.changed_states_truncated = uniq.length - 50;
   }
   return { ...out, ...extra };
+}
+
+/**
+ * Home Assistant treats entity_id / device_id / area_id / floor_id / label_id
+ * inside the action data as targets too. The generic tools only take targets
+ * through 'target' (or the tool's own entity/area parameters), so these keys
+ * are refused in free-form data. The client still checks them as well.
+ */
+export function rejectTargetKeysInData(data: Record<string, unknown> | undefined, where = "data") {
+  if (!data) return;
+  const found = TARGET_KEYS.filter((k) => k in data);
+  if (found.length) {
+    throw new HAError(
+      `Put ${found.join(", ")} in 'target' (or the tool's entity_ids / area_id / … parameters), not in '${where}'. Nothing was sent.`,
+    );
+  }
 }
 
 export function hasIndirect(t: { area_id?: unknown; floor_id?: unknown; device_id?: unknown; label_id?: unknown }) {

@@ -357,13 +357,18 @@ export function registerReadTools(ctx: ToolContext) {
       {
         title: "Render a template",
         description:
-          "Render a Home Assistant Jinja template and return the result. Templates can read states, areas, devices and do math, but cannot change anything. Example: \"{{ states.light | selectattr('state','eq','on') | map(attribute='entity_id') | list }}\"",
+          "Render a Home Assistant Jinja template and return the result. Templates can read states, areas, devices and do math, but cannot change anything. " +
+          "Rendering is stopped after timeout_seconds (default 3, max 10) so a heavy template can't stall Home Assistant. " +
+          "Example: \"{{ states.light | selectattr('state','eq','on') | map(attribute='entity_id') | list }}\"",
         inputSchema: {
           template: z.string().min(1).max(10_000).describe("Jinja template text"),
+          timeout_seconds: z.number().min(0.5).max(10).default(3).describe("Give up after this many seconds (max 10)"),
         },
         annotations: READ_ONLY,
       },
-      (async ({ template }) => ha.renderTemplate(template)),
+      // Websocket render_template with a timeout, never POST /api/template (no
+      // timeout there: a heavy template would block HA's event loop).
+      (async ({ template, timeout_seconds }) => ha.renderTemplateWithTimeout(template, timeout_seconds ?? 3)),
     );
   }
 }

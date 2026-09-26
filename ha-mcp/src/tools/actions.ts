@@ -13,6 +13,7 @@ import {
   hasIndirect,
   hasService,
   indirectTargetShape,
+  rejectTargetKeysInData,
   report,
   requireEntities,
   runService,
@@ -41,7 +42,10 @@ export function registerActionTools(ctx: ToolContext) {
 
   /** Check all calls first, then run them in order. */
   async function execute(plan: Planned[]): Promise<CallResult[]> {
-    for (const p of plan) await ha.assertNotBlocked(p.domain, p.opts);
+    for (const p of plan) {
+      ha.assertServiceAllowedFor(p.domain, p.service, "actions");
+      await ha.assertNotBlocked(p.domain, p.opts, p.service);
+    }
     const out: CallResult[] = [];
     for (const p of plan) out.push(await runService(ha, p.domain, p.service, p.opts));
     return out;
@@ -65,8 +69,10 @@ export function registerActionTools(ctx: ToolContext) {
       title: "Call any Home Assistant action (service)",
       description:
         "Call any Home Assistant action (a.k.a. service) with a target and data. Use this when no specific ha_* control tool fits " +
-        "(e.g. lock.unlock, alarm_control_panel.alarm_arm_away, input_select.select_next, homeassistant.reload_all, weather.get_forecasts). " +
-        "Use ha_list_services with a domain to see an action's fields first. The action is checked to exist before anything is sent.\n" +
+        "(e.g. lock.unlock, alarm_control_panel.alarm_arm_away, input_select.select_next, weather.get_forecasts). " +
+        "Use ha_list_services with a domain to see an action's fields first. The action is checked to exist before anything is sent. " +
+        "Targets go in 'target', never in 'data'. System-level actions (restart/stop, reloads, updates, backups, add-ons, recorder, logger, cloud) " +
+        "are refused here; they have dedicated tools under the config / management switches.\n" +
         "Examples:\n" +
         "- {domain:'light', service:'turn_on', target:{area_id:'kitchen'}, data:{brightness_pct:40}}\n" +
         "- {domain:'weather', service:'get_forecasts', target:{entity_id:'weather.home'}, data:{type:'daily'}, return_response:true}\n" +
@@ -85,6 +91,8 @@ export function registerActionTools(ctx: ToolContext) {
       annotations: DESTRUCTIVE,
     },
     async ({ domain, service, target, data, return_response }) => {
+      ha.assertServiceAllowedFor(domain, service, "actions");
+      rejectTargetKeysInData(data);
       const meta = await assertServiceExists(ha, domain, service);
       const ids = asArray<string>(target?.entity_id).filter((e) => e.toLowerCase() !== "all");
       const bad = ids.filter((e) => !ENTITY_RE.test(e));
@@ -177,6 +185,7 @@ export function registerActionTools(ctx: ToolContext) {
         if (!ids.length && !hasIndirect(ind)) {
           throw new HAError("Give entity_ids and/or area_id / floor_id / device_id / label_id.");
         }
+        rejectTargetKeysInData(args.data);
         const data: Record<string, unknown> = { ...(args.data ?? {}) };
         for (const k of ["brightness_pct", "color_name", "rgb_color", "color_temp_kelvin", "percentage", "transition"]) {
           if (args[k] !== undefined) data[k] = args[k];
@@ -893,31 +902,9 @@ export function registerActionTools(ctx: ToolContext) {
     },
     async ({ text, language, agent_id, conversation_id }) => {
       // Assist acts on its own, outside callService(), so blocked domains can't be
-      // enforced per call. Refuse if Assist can reach any entity in a blocked domain.
-      if (ha.blockedDomains.size) {
-        let exposed: Record<string, Record<string, boolean>>;
-        try {
-          const res = await ha.ws<{ exposed_entities?: Record<string, Record<string, boolean>> }>(
-            "homeassistant/expose_entity/list",
-            {},
-            "actions",
-          );
-          exposed = res?.exposed_entities ?? {};
-        } catch (err) {
-          throw new HAError(
-            `Refusing: blocked_domains is set and the entities exposed to Assist could not be checked (${err instanceof Error ? err.message : err}).`,
-          );
-        }
-        const hit = Object.entries(exposed)
-          .filter(([id, a]) => a?.conversation === true && ha.blockedDomains.has(domainOf(id)))
-          .map(([id]) => id);
-        if (hit.length) {
-          throw new HAError(
-            `Refusing: Assist can control entities in blocked domains (${hit.slice(0, 10).join(", ")}). ` +
-              "Un-expose them in Settings → Voice assistants → Expose, or use the specific ha_* tools.",
-          );
-        }
-      }
+      // enforced per call. The client refuses this POST (and conversation.process
+      // through ha_call_service) if Assist can reach any entity in a blocked
+      // domain, using homeassistant/expose_entity/list (HAClient.assertAssistSafe).
       const r = await ha.post<any>("/api/conversation/process", { text, language, agent_id, conversation_id }, "actions");
       const resp = r?.response ?? {};
       return {
@@ -978,8 +965,8 @@ export function registerActionTools(ctx: ToolContext) {
       if (PROTECTED_EVENTS.has(event_type.toLowerCase())) {
         throw new HAError(`Refusing to fire core system event '${event_type}'.`);
       }
-      // Enforce blocked domains on any entity/area/device referenced in the event data.
-      await ha.assertNotBlocked("event", { data: event_data });
+      // The client enforces blocked domains on any entity/area/device/label
+      // referenced in the event data before POST /api/events/* is sent.
       const r = await ha.post<unknown>(`/api/events/${encodeURIComponent(event_type)}`, event_data ?? {}, "actions");
       return { ok: true, event_type, result: r };
     },

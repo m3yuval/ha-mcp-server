@@ -18,6 +18,8 @@
 // ws message (ws). Return a value to send it as JSON (supervisor: wrapped in
 // {result:"ok",data}), or throw { status, body } / return reply(status, body).
 // Unmatched requests get 404 (REST) or a ws error, and are still recorded.
+// ws handlers may also return { __events: [ev, ...], result } (subscription:
+// the result, then one 'event' message per entry) or { __error: {code, message} }.
 
 import http from "node:http";
 import { spawn } from "node:child_process";
@@ -133,6 +135,16 @@ export async function startFakeHA(opts = {}) {
         }
         try {
           const result = await h(msg);
+          if (result && result.__error) {
+            // { __error: { code, message } } -> failed result with that error
+            return ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: result.__error }));
+          }
+          if (result && Array.isArray(result.__events)) {
+            // Subscription-style: { __events: [...], result } -> result, then one 'event' message per entry.
+            ws.send(JSON.stringify({ id: msg.id, type: "result", success: true, result: result.result ?? null }));
+            for (const event of result.__events) ws.send(JSON.stringify({ id: msg.id, type: "event", event }));
+            return;
+          }
           ws.send(JSON.stringify({ id: msg.id, type: "result", success: true, result: result ?? null }));
         } catch (e) {
           ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { code: "error", message: String(e?.message ?? e) } }));

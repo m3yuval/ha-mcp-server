@@ -7,8 +7,12 @@
  *   - Every other request must name a capability ("actions" | "config" |
  *     "management"). If that capability is not enabled in the add-on options,
  *     the request throws BEFORE anything is sent.
+ *   - System-level actions (SYSTEM_SERVICES: restart/stop, hassio.*, update.*,
+ *     backup.*, recorder.*, logger.*, reloads, ...) are never reachable with
+ *     'actions'; reloads need 'config', the rest 'management'.
  *   - Service calls always enforce BLOCKED_DOMAINS, including entities reached
- *     indirectly through area/device/floor/label targets.
+ *     indirectly through area/device/floor/label/group targets and entity ids
+ *     mentioned in the data. See BLOCKED_DOMAINS_LIMITS for what it can't cover.
  *
  * Tool modules must go through this client; they must not call fetch() or open
  * websockets themselves, so these gates can't be bypassed.
@@ -45,7 +49,82 @@ export const READ_ONLY_WS_COMMANDS = new Set([
   "homeassistant/expose_entity/list",
 ]);
 
+/**
+ * What blocked_domains can and cannot guarantee. Exported so docs and tool
+ * descriptions can reuse the exact wording.
+ */
+export const BLOCKED_DOMAINS_LIMITS =
+  "blocked_domains stops this server from calling actions on entities in those domains, including entities reached " +
+  "through area, floor, device and label targets, old-style group.* members, and entity ids mentioned anywhere in the " +
+  "action data. While it is set, registry ids (UUIDs) and 'all' are refused as targets, and so are scene.apply, " +
+  "scene.create, group.set, the intent API, and Assist when Assist can reach a blocked entity. It cannot see what " +
+  "Home Assistant does on its own afterwards: scripts, automations and scenes that act on blocked entities internally; " +
+  "input helpers, counters, timers, buttons or events that trigger such automations; integrations that run commands or " +
+  "send raw messages (python_script, shell_command, rest_command, command_line, pyscript, mqtt.publish, " +
+  "remote.send_command, zha / zwave_js / esphome services and similar). Treat it as a guard rail against mistakes, not " +
+  "a security boundary: for real isolation, don't wire those devices to anything the assistant can trigger.";
+
+/** Keys that Home Assistant treats as action targets, both in 'target' and in the data. */
+export const TARGET_KEYS = ["entity_id", "device_id", "area_id", "floor_id", "label_id"] as const;
+
+const ENTITY_ID_RE = /^[a-z0-9_]+\.[a-z0-9_]+$/;
+
+/**
+ * System-level actions. They are refused when called with the 'actions'
+ * capability (ha_call_service and every device-control tool) and are only
+ * reachable from the dedicated config / management tools.
+ *   "domain.*"                  every action of that domain
+ *   "*.reload", "*.reload_*"    reload actions of any domain (config level)
+ *   "domain.name"               one action
+ */
+export const SYSTEM_SERVICES = [
+  "hassio.*",
+  "homeassistant.*",
+  "update.*",
+  "backup.*",
+  "recorder.*",
+  "logger.*",
+  "system_log.*",
+  "cloud.*",
+  "*.reload",
+  "*.reload_*",
+] as const;
+
+/** Exceptions to SYSTEM_SERVICES: ordinary device control through homeassistant.* */
+export const SYSTEM_SERVICE_EXCEPTIONS = new Set([
+  "homeassistant.turn_on",
+  "homeassistant.turn_off",
+  "homeassistant.toggle",
+  "homeassistant.update_entity",
+]);
+
+/**
+ * Which capability a system-level action needs, or null for ordinary actions.
+ * Reloads need 'config' (or 'management'); everything else in SYSTEM_SERVICES
+ * needs 'management'.
+ */
+export function systemServiceLevel(domain: string, service: string): "config" | "management" | null {
+  if (SYSTEM_SERVICE_EXCEPTIONS.has(`${domain}.${service}`)) return null;
+  const matched = SYSTEM_SERVICES.some((p) => {
+    const [pd, ps] = p.split(".");
+    const domOk = pd === "*" || pd === domain;
+    const svcOk = ps === "*" || (ps.endsWith("*") ? service.startsWith(ps.slice(0, -1)) : ps === service);
+    return domOk && svcOk;
+  });
+  if (!matched) return null;
+  return service === "reload" || service.startsWith("reload_") ? "config" : "management";
+}
+
+/** Actions that can reach arbitrary entities in ways we can't check; refused while blocked_domains is set. */
+const REFUSED_WHILE_BLOCKED = new Set(["scene.apply", "scene.create", "group.set"]);
+/** Websocket commands that act without a checkable target; refused while blocked_domains is set. */
+const WS_REFUSED_WHILE_BLOCKED = new Set(["execute_script", "fire_event", "intent/handle"]);
+/** Websocket commands that run Assist; allowed only if Assist can't reach a blocked entity. */
+const WS_ASSIST_COMMANDS = new Set(["conversation/process", "assist_pipeline/run"]);
+
 export class HAError extends Error {
+  /** Websocket error code from Home Assistant, when there is one (e.g. 'template_error'). */
+  code?: string;
   constructor(message: string, public status?: number) {
     super(message);
   }
@@ -130,6 +209,38 @@ export class HAClient {
     return this.rest<string>("POST", "/api/template", { template });
   }
 
+  /**
+   * Render a user-supplied template with a time limit, via the websocket
+   * render_template command. POST /api/template has no timeout, so a template
+   * such as nested range(100000) loops would block Home Assistant's event loop.
+   * HA answers with a result (the subscription started, or an error such as
+   * "Exceeded maximum execution time") and then an event carrying {result} or
+   * {error, level}. Closing the socket ends the subscription. Read-only.
+   */
+  async renderTemplateWithTimeout(template: string, timeoutSeconds = 3): Promise<unknown> {
+    const timeout = Math.min(Math.max(timeoutSeconds, 0.1), 10);
+    const warnings: string[] = [];
+    return this.wsRaw<unknown>(
+      "render_template",
+      { template, timeout, report_errors: true, strict: false },
+      {
+        timeoutMs: Math.min(this.timeoutMs, timeout * 1000 + 5000),
+        onEvent: (ev: any) => {
+          if (ev && typeof ev === "object" && "result" in ev) {
+            return { done: true, value: warnings.length ? { result: ev.result, warnings } : ev.result };
+          }
+          if (ev && typeof ev === "object" && "error" in ev) {
+            if (String(ev.level ?? "ERROR").toUpperCase() === "ERROR") {
+              return { done: true, error: new HAError(`Template error: ${ev.error}`) };
+            }
+            warnings.push(String(ev.error));
+          }
+          return { done: false };
+        },
+      },
+    );
+  }
+
   /** Run a read-only websocket command (must be in READ_ONLY_WS_COMMANDS). */
   async wsRead<T = unknown>(type: string, payload: Record<string, unknown> = {}): Promise<T> {
     if (!READ_ONLY_WS_COMMANDS.has(type)) {
@@ -150,6 +261,16 @@ export class HAClient {
     if (path.startsWith("/api/services/")) {
       throw new HAError("Use callService() for service calls so blocked domains are enforced");
     }
+    const basePath = path.split("?")[0];
+    if (this.blockedDomains.size) {
+      if (basePath === "/api/intent/handle") {
+        throw new HAError("Refusing the intent API while blocked_domains is set (intents are not limited to exposed entities).");
+      }
+      if (basePath === "/api/conversation/process") await this.assertAssistSafe();
+      if (basePath.startsWith("/api/events/")) {
+        await this.assertNotBlocked(null, { data: (body ?? {}) as Record<string, unknown> });
+      }
+    }
     return this.rest<T>("POST", path, body);
   }
 
@@ -165,12 +286,21 @@ export class HAClient {
     if (type === "call_service") {
       throw new HAError("Use callService() for service calls so blocked domains are enforced");
     }
+    if (this.blockedDomains.size) {
+      if (WS_REFUSED_WHILE_BLOCKED.has(type)) {
+        throw new HAError(`Refusing websocket command '${type}' while blocked_domains is set (its targets can't be checked).`);
+      }
+      if (WS_ASSIST_COMMANDS.has(type)) await this.assertAssistSafe();
+    }
     return this.wsRaw<T>(type, payload);
   }
 
   /**
-   * Call a service (action). Enforces blocked domains on the service domain and
-   * on every entity the call targets, including via area/device/floor/label.
+   * Call a service (action). Enforces:
+   *   - the capability, and SYSTEM_SERVICES: system-level actions are never
+   *     reachable with 'actions'; reloads need 'config', the rest 'management';
+   *   - blocked domains on the service domain and on every entity the call
+   *     targets, including via area/device/floor/label/group (assertNotBlocked).
    */
   async callService<T = unknown>(
     domain: string,
@@ -182,7 +312,8 @@ export class HAClient {
     if (!/^[a-z0-9_]+$/.test(domain) || !/^[a-z0-9_]+$/.test(service)) {
       throw new HAError(`Invalid service name '${domain}.${service}'`);
     }
-    await this.assertNotBlocked(domain, opts);
+    this.assertServiceAllowedFor(domain, service, cap);
+    await this.assertNotBlocked(domain, opts, service);
     const body: Record<string, unknown> = { ...(opts.data ?? {}) };
     if (opts.target) {
       for (const [k, v] of Object.entries(opts.target)) {
@@ -193,43 +324,174 @@ export class HAClient {
     return this.rest<T>("POST", `/api/services/${domain}/${service}${query}`, body);
   }
 
-  /** Throws if the call touches a blocked domain. */
-  async assertNotBlocked(domain: string, opts: ServiceCallOptions = {}) {
+  /** Throws if a system-level action is called with a capability that may not reach it. */
+  assertServiceAllowedFor(domain: string, service: string, cap: Capability) {
+    const level = systemServiceLevel(domain, service);
+    if (!level) return;
+    if (cap === "management" || (level === "config" && cap === "config")) return;
+    const need =
+      level === "config"
+        ? "the 'enable_config_files' (or 'enable_management') switch and the ha_reload_config tool"
+        : "the 'enable_management' switch and the matching management tool (e.g. ha_restart, ha_install_update, ha_set_log_level, ha_purge_recorder, the backup and add-on tools)";
+    throw new HAError(
+      `Refusing ${domain}.${service}: it is a system-level action and is not available through the '${cap}' capability. ` +
+        `It needs ${need}.`,
+    );
+  }
+
+  /**
+   * Throws unless Assist is safe to use with blocked_domains set: no entity in
+   * a blocked domain may be exposed to the conversation assistant.
+   */
+  async assertAssistSafe() {
     if (this.blockedDomains.size === 0) return;
-    if (this.blockedDomains.has(domain.toLowerCase())) {
-      throw new HAError(`Domain '${domain}' is blocked by the add-on configuration (blocked_domains)`);
+    let exposed: Record<string, Record<string, boolean>>;
+    try {
+      const res = await this.wsRaw<{ exposed_entities?: Record<string, Record<string, boolean>> }>(
+        "homeassistant/expose_entity/list",
+        {},
+      );
+      exposed = res?.exposed_entities ?? {};
+    } catch (err) {
+      throw new HAError(
+        `Refusing: blocked_domains is set and the entities exposed to Assist could not be checked (${err instanceof Error ? err.message : err}).`,
+      );
     }
-    const t = opts.target ?? {};
-    const d = opts.data ?? {};
-    const entities = [...toArray(t.entity_id), ...toArray(d.entity_id)];
-    const indirect = {
-      areas: [...toArray(t.area_id), ...toArray(d.area_id)],
-      devices: [...toArray(t.device_id), ...toArray(d.device_id)],
-      floors: [...toArray(t.floor_id), ...toArray(d.floor_id)],
-      labels: [...toArray(t.label_id), ...toArray(d.label_id)],
-    };
-    if (entities.some((e) => e.toLowerCase() === "all")) {
-      throw new HAError("entity_id 'all' is not allowed while blocked_domains is set");
-    }
-    if (Object.values(indirect).some((l) => l.length)) {
-      const tpl =
-        `{% set ns = namespace(e=[]) %}` +
-        `{% for a in ${JSON.stringify(indirect.areas)} %}{% set ns.e = ns.e + area_entities(a) %}{% endfor %}` +
-        `{% for f in ${JSON.stringify(indirect.floors)} %}{% for a in floor_areas(f) %}{% set ns.e = ns.e + area_entities(a) %}{% endfor %}{% endfor %}` +
-        `{% for dv in ${JSON.stringify(indirect.devices)} %}{% set ns.e = ns.e + device_entities(dv) %}{% endfor %}` +
-        `{% for l in ${JSON.stringify(indirect.labels)} %}{% set ns.e = ns.e + label_entities(l) %}{% endfor %}` +
-        `{{ ns.e | tojson }}`;
-      const raw = await this.renderTemplate(tpl);
-      entities.push(...(JSON.parse(String(raw)) as string[]));
-    }
-    const hit = entities.filter((e) => this.blockedDomains.has(e.split(".")[0].toLowerCase()));
+    const hit = Object.entries(exposed)
+      .filter(([id, a]) => a?.conversation === true && this.blockedDomains.has(id.split(".")[0].toLowerCase()))
+      .map(([id]) => id);
     if (hit.length) {
       throw new HAError(
-        `Refusing: the call targets blocked entities (${[...new Set(hit)].slice(0, 10).join(", ")}). ` +
-          `Blocked domains: ${[...this.blockedDomains].join(", ")}`,
+        `Refusing: Assist can control entities in blocked domains (${hit.slice(0, 10).join(", ")}). ` +
+          "Un-expose them in Settings → Voice assistants → Expose, or use the specific ha_* tools.",
       );
     }
   }
+
+  /**
+   * Throws if a call could touch a blocked domain. `domain` is the action's
+   * domain (null for events); `service` the action name, when known.
+   *
+   * - Entity values from target AND data are read the way Home Assistant reads
+   *   them: comma separated, trimmed, lower case. While blocked_domains is set,
+   *   'all' and anything that isn't a plain entity id (e.g. an entity-registry
+   *   UUID, which HA also accepts) are refused.
+   * - Area / floor / device / label targets and old-style group.* entities are
+   *   expanded with a template, like homeassistant/helpers/target.py: a label
+   *   reaches labelled entities, labelled devices' entities and labelled
+   *   areas' entities; groups are expanded with expand().
+   * - Every string in the data (keys and values, deep) is scanned for
+   *   '<blocked_domain>.<object_id>'.
+   * - scene.apply / scene.create / group.set are refused and conversation.process
+   *   needs Assist to be unable to reach blocked entities.
+   *
+   * This is a guard rail, not a sandbox: see BLOCKED_DOMAINS_LIMITS for what it
+   * cannot see (scripts/automations/scenes acting internally, helpers or events
+   * that trigger automations, command-running integrations, ...).
+   */
+  async assertNotBlocked(domain: string | null, opts: ServiceCallOptions = {}, service?: string) {
+    if (this.blockedDomains.size === 0) return;
+    const blockedList = [...this.blockedDomains].join(", ");
+    if (domain && this.blockedDomains.has(domain.toLowerCase())) {
+      throw new HAError(`Domain '${domain}' is blocked by the add-on configuration (blocked_domains)`);
+    }
+    if (domain && service) {
+      const full = `${domain}.${service}`.toLowerCase();
+      if (REFUSED_WHILE_BLOCKED.has(full)) {
+        throw new HAError(
+          `Refusing ${full} while blocked_domains is set: it can act on any entity in ways that can't be checked. Blocked domains: ${blockedList}`,
+        );
+      }
+      if (full === "conversation.process") await this.assertAssistSafe();
+    }
+    const t = (opts.target ?? {}) as Record<string, unknown>;
+    const d = (opts.data ?? {}) as Record<string, unknown>;
+
+    const entities: string[] = [];
+    for (const raw of [...toArray(t.entity_id), ...toArray(d.entity_id)]) {
+      for (const part of raw.split(",")) {
+        const e = part.trim().toLowerCase();
+        if (e) entities.push(e);
+      }
+    }
+    if (entities.includes("all")) {
+      throw new HAError("entity_id 'all' is not allowed while blocked_domains is set");
+    }
+    const direct = entities.filter((e) => e !== "none");
+    const invalid = direct.filter((e) => !ENTITY_ID_RE.test(e));
+    if (invalid.length) {
+      throw new HAError(
+        `Refusing: '${invalid.slice(0, 5).join("', '")}' is not a plain entity id (domain.object_id). ` +
+          "While blocked_domains is set, entity targets must be entity ids like 'light.kitchen' (registry ids are not accepted).",
+      );
+    }
+    const ids = (k: string) => [...toArray(t[k]), ...toArray(d[k])].map((v) => v.trim()).filter(Boolean);
+    const indirect = { areas: ids("area_id"), devices: ids("device_id"), floors: ids("floor_id"), labels: ids("label_id") };
+    const reached = [...direct];
+    const needsExpansion = Object.values(indirect).some((l) => l.length) || direct.some((e) => e.startsWith("group."));
+    if (needsExpansion) {
+      const j = JSON.stringify;
+      const tpl =
+        `{% set ns = namespace(e=[]) %}` +
+        `{% for a in ${j(indirect.areas)} %}{% set ns.e = ns.e + area_entities(a) %}{% endfor %}` +
+        `{% for f in ${j(indirect.floors)} %}{% for a in floor_areas(f) %}{% set ns.e = ns.e + area_entities(a) %}{% endfor %}{% endfor %}` +
+        `{% for dv in ${j(indirect.devices)} %}{% set ns.e = ns.e + device_entities(dv) %}{% endfor %}` +
+        `{% for l in ${j(indirect.labels)} %}{% set ns.e = ns.e + label_entities(l) %}` +
+        `{% for dv in label_devices(l) %}{% set ns.e = ns.e + device_entities(dv) %}{% endfor %}` +
+        `{% for a in label_areas(l) %}{% set ns.e = ns.e + area_entities(a) %}{% endfor %}{% endfor %}` +
+        `{% set ns.e = ns.e + ${j(direct)} %}` +
+        `{{ (ns.e + (expand(ns.e) | map(attribute='entity_id') | list)) | unique | list | tojson }}`;
+      const raw = await this.renderTemplate(tpl);
+      let expanded: unknown;
+      try {
+        expanded = typeof raw === "string" ? JSON.parse(raw) : raw;
+      } catch {
+        expanded = undefined;
+      }
+      if (!Array.isArray(expanded)) {
+        throw new HAError(`Refusing: could not expand the call's targets to check blocked_domains (${String(raw).slice(0, 200)})`);
+      }
+      reached.push(...expanded.map((e) => String(e).toLowerCase()));
+    }
+    const hit = reached.filter((e) => this.blockedDomains.has(e.split(".")[0]));
+    if (hit.length) {
+      throw new HAError(
+        `Refusing: the call targets blocked entities (${[...new Set(hit)].slice(0, 10).join(", ")}). ` +
+          `Blocked domains: ${blockedList}`,
+      );
+    }
+    const mentioned = this.blockedTokens(d);
+    if (mentioned.length) {
+      throw new HAError(
+        `Refusing: the action data mentions blocked entities (${mentioned.slice(0, 10).join(", ")}). Blocked domains: ${blockedList}`,
+      );
+    }
+  }
+
+  /** Every '<blocked_domain>.<object_id>' token in a value's strings (keys and values, deep). */
+  private blockedTokens(value: unknown): string[] {
+    const doms = [...this.blockedDomains].map((x) => x.replace(/[^a-z0-9_]/g, "")).filter(Boolean);
+    if (!doms.length) return [];
+    const re = new RegExp(`(?:^|[^a-z0-9_])((?:${doms.join("|")})\\.[a-z0-9_]+)`, "gi");
+    const found = new Set<string>();
+    const scan = (s: string) => {
+      for (const m of s.matchAll(re)) found.add(m[1].toLowerCase());
+    };
+    const walk = (v: unknown, depth: number) => {
+      if (depth > 32 || v === null || v === undefined) return;
+      if (typeof v === "string") return scan(v);
+      if (Array.isArray(v)) return v.forEach((x) => walk(x, depth + 1));
+      if (typeof v === "object") {
+        for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+          scan(k);
+          walk(x, depth + 1);
+        }
+      }
+    };
+    walk(value, 0);
+    return [...found];
+  }
+
 
   // ----------------------------------------------------------- supervisor
 
@@ -310,10 +572,20 @@ export class HAClient {
     return text as T;
   }
 
-  /** Open a websocket, authenticate, run one command, close. */
-  private wsRaw<T>(type: string, payload: Record<string, unknown>): Promise<T> {
+  /**
+   * Open a websocket, authenticate, run one command, close.
+   * With `sub`, the command is a subscription: after a successful result the
+   * socket stays open and each 'event' message for it goes to sub.onEvent until
+   * that returns done. Closing the socket ends the subscription on HA's side.
+   */
+  private wsRaw<T>(
+    type: string,
+    payload: Record<string, unknown>,
+    sub?: { onEvent: (event: unknown) => { done: boolean; value?: unknown; error?: Error }; timeoutMs?: number },
+  ): Promise<T> {
     const url = this.baseUrl.replace(/^http/, "ws") + "/api/websocket";
     const started = Date.now();
+    const timeoutMs = sub?.timeoutMs ?? this.timeoutMs;
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       const ws = new WebSocket(url);
@@ -330,7 +602,7 @@ export class HAClient {
         if (err) reject(err);
         else resolve(value as T);
       };
-      const timer = setTimeout(() => finish(new HAError(`Websocket timeout after ${this.timeoutMs}ms`)), this.timeoutMs);
+      const timer = setTimeout(() => finish(new HAError(`Websocket timeout after ${timeoutMs}ms`)), timeoutMs);
       ws.onerror = () => finish(new HAError(`Could not open websocket to Home Assistant`));
       ws.onclose = () => finish(new HAError("Websocket closed before a result was received"));
       ws.onmessage = (ev) => {
@@ -347,8 +619,16 @@ export class HAClient {
         } else if (msg.type === "auth_ok") {
           ws.send(JSON.stringify({ ...payload, id: 1, type }));
         } else if (msg.type === "result" && msg.id === 1) {
-          if (msg.success) finish(null, msg.result as T);
-          else finish(new HAError(`Websocket command '${type}' failed: ${msg.error?.message ?? "unknown error"}`));
+          if (!msg.success) {
+            const err = new HAError(`Websocket command '${type}' failed: ${msg.error?.message ?? "unknown error"}`);
+            err.code = msg.error?.code;
+            finish(err);
+          } else if (!sub) {
+            finish(null, msg.result as T);
+          }
+        } else if (sub && msg.type === "event" && msg.id === 1) {
+          const r = sub.onEvent(msg.event);
+          if (r.done) finish(r.error ?? null, r.value as T);
         }
       };
     });

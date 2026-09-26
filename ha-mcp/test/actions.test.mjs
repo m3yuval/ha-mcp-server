@@ -13,6 +13,7 @@ const STATES = Object.fromEntries(
     st("light.bedroom", "off", { friendly_name: "Bedroom Light" }),
     st("switch.fan_plug", "off"),
     st("group.downstairs", "off"),
+    st("group.doors", "off", { entity_id: ["lock.front_door"] }),
     st("lock.front_door", "locked", { friendly_name: "Front Door" }),
     st("climate.living_room", "heat", {
       hvac_modes: ["off", "heat", "cool", "heat_cool"],
@@ -58,7 +59,10 @@ const SERVICES = [
   { domain: "input_datetime", services: svc("set_datetime") },
   { domain: "number", services: svc("set_value") },
   { domain: "script", services: svc("turn_on", "turn_off", "toggle", "good_night") },
-  { domain: "scene", services: svc("turn_on") },
+  { domain: "scene", services: svc("turn_on", "apply", "create") },
+  { domain: "group", services: svc("set", "remove") },
+  { domain: "conversation", services: svc("process") },
+  { domain: "hassio", services: svc("host_shutdown", "addon_stop") },
   { domain: "automation", services: svc("trigger", "turn_on", "turn_off", "toggle") },
   { domain: "button", services: svc("press") },
   { domain: "input_button", services: svc("press") },
@@ -89,6 +93,17 @@ const fake = await startFakeHA({
       return { changed_states: changed, service_response };
     },
     "POST /api/events/*": ({ path }) => ({ message: `Event ${path.split("/").pop()} fired.` }),
+    // Blocked-domain target expansion (see HAClient.assertNotBlocked).
+    "POST /api/template": ({ body }) => {
+      const t = body?.template ?? "";
+      if (!t.includes("namespace(e=[])")) return reply(200, "rendered");
+      const out = [];
+      if (t.includes('"kitchen"')) out.push("light.kitchen", "lock.front_door");
+      // label -> labelled device -> its lock (only if the template follows label_devices)
+      if (t.includes('"security"') && t.includes("label_devices(l)")) out.push("lock.front_door");
+      if (t.includes('"group.doors"') && t.includes("expand(")) out.push("group.doors", "lock.front_door");
+      return reply(200, JSON.stringify(out));
+    },
     "POST /api/conversation/process": ({ body }) => ({
       response: {
         response_type: "action_done",
@@ -102,6 +117,10 @@ const fake = await startFakeHA({
   },
   ws: {
     "homeassistant/expose_entity/list": () => ({ exposed_entities: exposed }),
+    render_template: (msg) =>
+      msg.template.includes("range(")
+        ? { __error: { code: "template_error", message: `Exceeded maximum execution time of ${msg.timeout}s` } }
+        : { __events: [{ result: "rendered-ws", listeners: {} }] },
   },
 });
 
@@ -569,4 +588,93 @@ test("ha_fire_event posts event data; system events and blocked entities refused
   const badType = await call("ha_fire_event", { event_type: "bad type/../x" });
   assert.ok(badType.isError);
   assert.deepEqual(fake.writes(), []);
+});
+
+// ------------------------------------------------------ security findings
+
+test("H1: ha_call_service refuses system-level actions and names the switch; nothing sent", async () => {
+  for (const [domain, service, sw] of [
+    ["hassio", "host_shutdown", "enable_management"],
+    ["hassio", "addon_stop", "enable_management"],
+    ["homeassistant", "restart", "enable_management"],
+    ["update", "install", "enable_management"],
+    ["homeassistant", "reload_all", "enable_config_files"],
+  ]) {
+    const r = await call("ha_call_service", { domain, service, data: { addon: "self" } });
+    assert.ok(r.isError, `${domain}.${service}`);
+    assert.match(r.text, new RegExp(`system-level action.*${sw}`), `${domain}.${service}`);
+  }
+  assert.deepEqual(fake.writes(), []);
+  // Ordinary homeassistant.* device control still works
+  await ok("ha_call_service", { domain: "homeassistant", service: "update_entity", target: { entity_id: "sensor.temp" } });
+});
+
+test("H2: target keys inside data are refused; comma/uuid entity values can't sneak past blocked_domains", async () => {
+  for (const key of ["entity_id", "device_id", "area_id", "floor_id", "label_id"]) {
+    const r = await call("ha_call_service", { domain: "light", service: "turn_on", data: { [key]: "lock.front_door" } });
+    assert.ok(r.isError, key);
+    assert.match(r.text, new RegExp(`Put ${key} in 'target'`));
+  }
+  const sw = await call("ha_turn_on", { entity_ids: "light.kitchen", data: { entity_id: "light.kitchen,lock.front_door" } });
+  assert.ok(sw.isError);
+  assert.match(sw.text, /Put entity_id in 'target'/);
+  const comma = await call("ha_call_service", { domain: "homeassistant", service: "turn_off", target: { entity_id: "light.kitchen,lock.front_door" } });
+  assert.ok(comma.isError);
+  const uuid = await call("ha_call_service", { domain: "homeassistant", service: "turn_off", target: { entity_id: "0123456789abcdef0123456789abcdef" } });
+  assert.ok(uuid.isError);
+  assert.deepEqual(fake.writes(), []);
+});
+
+test("H3: a label that reaches a lock through a labelled device is refused", async () => {
+  const r = await call("ha_turn_off", { label_id: "security" });
+  assert.ok(r.isError);
+  assert.match(r.text, /blocked entities \(lock\.front_door\)/);
+  const tpl = fake.requests.find((x) => x.path === "/api/template").body.template;
+  for (const fn of ["label_entities(l)", "label_devices(l)", "label_areas(l)", "device_entities(dv)", "area_entities(a)"]) assert.ok(tpl.includes(fn), fn);
+  assert.deepEqual(fake.writes(), []);
+});
+
+test("H4: groups are expanded; scene.apply/create, group.set, conversation.process and blocked mentions refused", async () => {
+  const grp = await call("ha_turn_off", { entity_ids: "group.doors" });
+  assert.ok(grp.isError);
+  assert.match(grp.text, /lock\.front_door/);
+  for (const service of ["apply", "create"]) {
+    const r = await call("ha_call_service", { domain: "scene", service, data: { entities: { "light.kitchen": "on" } } });
+    assert.ok(r.isError);
+    assert.match(r.text, new RegExp(`scene\\.${service} while blocked_domains`));
+  }
+  const gs = await call("ha_call_service", { domain: "group", service: "set", data: { object_id: "x", entities: ["light.kitchen"] } });
+  assert.ok(gs.isError);
+  exposed = { "lock.front_door": { conversation: true } };
+  const conv = await call("ha_call_service", { domain: "conversation", service: "process", data: { text: "unlock the door" } });
+  assert.ok(conv.isError);
+  assert.match(conv.text, /Assist can control/);
+  const note = await call("ha_send_notification", { persistent: true, message: "state of lock.front_door" });
+  assert.ok(note.isError);
+  assert.match(note.text, /mentions blocked entities/);
+  const scriptVars = await call("ha_run_script", { entity_id: "script.good_night", variables: { target: "lock.front_door" } });
+  assert.ok(scriptVars.isError);
+  assert.deepEqual(fake.writes(), []);
+  // Multi-call plans are all checked before the first call is sent
+  const mixed = await call("ha_turn_off", { entity_ids: ["light.kitchen", "group.doors"] });
+  assert.ok(mixed.isError);
+  assert.equal(serviceCalls().length, 0);
+});
+
+test("M4: ha_render_template renders over the websocket with a timeout, never POST /api/template", async () => {
+  const r = await srv.call("ha_render_template", { template: "{{ 1 }}" });
+  assert.ok(!r.isError, r.text);
+  assert.match(r.text, /rendered-ws/);
+  const req = fake.requests.find((x) => x.type === "render_template");
+  assert.equal(req.payload.timeout, 3);
+  assert.equal(req.payload.report_errors, true);
+  const slow = await srv.call("ha_render_template", {
+    template: "{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}",
+    timeout_seconds: 5,
+  });
+  assert.ok(slow.isError);
+  assert.match(slow.text, /Exceeded maximum execution time of 5s/);
+  const tooLong = await call("ha_render_template", { template: "{{ 1 }}", timeout_seconds: 60 });
+  assert.ok(tooLong.isError);
+  assert.ok(!fake.requests.some((x) => x.path === "/api/template"));
 });
