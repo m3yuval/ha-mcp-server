@@ -142,8 +142,15 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
         );
       }
       if (area) {
-        const ids = await renderJson<string[]>(ha, `{{ area_entities('${jinjaStr(area)}') | tojson }}`);
-        const set = new Set(ids);
+        const a = jinjaStr(area);
+        const found = await renderJson<{ id: string | null; entities: string[] }>(
+          ha,
+          `{% set a = '${a}' if area_name('${a}') else area_id('${a}') %}{{ {'id': a or none, 'entities': area_entities(a) if a else []} | tojson }}`,
+        );
+        if (!found.id) {
+          throw new HAError(`Area '${area}' not found. Use ha_list_areas to see area names and ids.`);
+        }
+        const set = new Set(found.entities);
         states = states.filter((s) => set.has(s.entity_id));
       }
       const total = states.length;
@@ -302,7 +309,17 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       inputSchema: {},
       annotations: READ_ONLY,
     },
-    safe(async () => ha.get("/api/calendars")),
+    safe(async () => {
+      try {
+        return await ha.get("/api/calendars");
+      } catch (err) {
+        // HA only registers /api/calendars when the calendar integration is loaded.
+        if (err instanceof HAError && err.status === 404) {
+          return { calendars: [], note: "No calendar integration is set up in this Home Assistant." };
+        }
+        throw err;
+      }
+    }),
   );
 
   server.registerTool(
@@ -320,7 +337,14 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     safe(async ({ entity_id, start, end }) => {
       const s = start ?? new Date().toISOString();
       const e = end ?? new Date(new Date(s).getTime() + 7 * 86400_000).toISOString();
-      return ha.get(`/api/calendars/${encodeURIComponent(entity_id)}`, { start: s, end: e });
+      try {
+        return await ha.get(`/api/calendars/${encodeURIComponent(entity_id)}`, { start: s, end: e });
+      } catch (err) {
+        if (err instanceof HAError && err.status === 404) {
+          throw new HAError(`Calendar '${entity_id}' not found. Use ha_list_calendars to see calendars.`);
+        }
+        throw err;
+      }
     }),
   );
 
@@ -328,15 +352,44 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     "ha_get_error_log",
     {
       title: "Get error log",
-      description: "Get the last lines of the Home Assistant error log. Useful for debugging integrations.",
+      description:
+        "Get recent errors and warnings logged by Home Assistant (the same list as Settings → System → Logs), newest first. Useful for debugging integrations.",
       inputSchema: {
-        lines: z.number().int().min(1).max(2000).default(200).describe("How many of the last lines to return"),
+        level: z
+          .enum(["ERROR", "WARNING", "CRITICAL", "INFO", "DEBUG"])
+          .optional()
+          .describe("Only entries of this level. Default: all levels"),
+        search: z.string().optional().describe("Case-insensitive text to match in the logger name, source or message"),
+        limit: z.number().int().min(1).max(500).default(50).describe("Max entries to return"),
+        include_exceptions: z.boolean().default(false).describe("Include stack traces (can be long)"),
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ lines }) => {
-      const log = await ha.get<string>("/api/error_log");
-      return String(log).split("\n").slice(-lines).join("\n");
+    safe(async ({ level, search, limit, include_exceptions }) => {
+      let entries = await ha.wsCommand<any[]>("system_log/list");
+      if (level) entries = entries.filter((e) => e.level === level);
+      if (search) {
+        const q = search.toLowerCase();
+        entries = entries.filter((e) =>
+          [e.name, ...(e.source ?? []), ...(e.message ?? [])].some((v) => String(v).toLowerCase().includes(q)),
+        );
+      }
+      entries.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+      const total = entries.length;
+      return {
+        total,
+        returned: Math.min(total, limit),
+        entries: entries.slice(0, limit).map((e) => ({
+          level: e.level,
+          logger: e.name,
+          message: Array.isArray(e.message) ? e.message.join("\n") : e.message,
+          source: Array.isArray(e.source) ? e.source.join(":") : e.source,
+          count: e.count,
+          first_occurred: e.first_occurred ? new Date(e.first_occurred * 1000).toISOString() : undefined,
+          last_occurred: e.timestamp ? new Date(e.timestamp * 1000).toISOString() : undefined,
+          exception: include_exceptions && e.exception ? String(e.exception).slice(0, 4000) : undefined,
+        })),
+      };
     }),
   );
 

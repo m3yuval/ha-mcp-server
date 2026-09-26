@@ -1,5 +1,5 @@
 name: Home Assistant MCP (read-only)
-version: "0.1.0"
+version: "0.1.1"
 slug: ha-mcp
 description: Read-only MCP server so Claude can look at your home (entities, areas, history, logbook) without changing anything
 url: "https://github.com/m3yuval/ha-mcp-server"

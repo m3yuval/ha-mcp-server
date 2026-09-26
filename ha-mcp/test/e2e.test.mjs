@@ -7,11 +7,14 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { WebSocketServer } from "ws";
 
 const HA_TOKEN = "test-ha-token";
 const MCP_TOKEN = "test-mcp-token";
 const MCP_PORT = 39123;
 const writeAttempts = [];
+const wsCommandsSeen = [];
+let calendarsLoaded = true;
 
 const now = new Date().toISOString();
 const states = [
@@ -39,7 +42,8 @@ before(async () => {
         const { template } = JSON.parse(body);
         res.writeHead(200, { "content-type": "text/plain" });
         if (template.includes("areas()")) return res.end(JSON.stringify([{ id: "kitchen", name: "Kitchen", entities: ["light.kitchen"] }]));
-        if (template.includes("area_entities('Kitchen')")) return res.end(JSON.stringify(["light.kitchen"]));
+        if (template.includes("area_name('Kitchen')")) return res.end(JSON.stringify({ id: "kitchen", entities: ["light.kitchen"] }));
+        if (template.includes("area_name('Nowhere')")) return res.end(JSON.stringify({ id: null, entities: [] }));
         return res.end("rendered:" + template);
       }
       if (req.method !== "GET") {
@@ -56,13 +60,31 @@ before(async () => {
       if (p === "/api/services") return json(res, [{ domain: "light", services: { turn_on: { name: "Turn on", description: "Turn on a light", fields: { brightness: { description: "0-255" } } } } }]);
       if (p.startsWith("/api/history/period/")) return json(res, [[{ entity_id: "sensor.outdoor_temp", state: "23", last_changed: now }, { entity_id: "sensor.outdoor_temp", state: "24.5", last_changed: now }]]);
       if (p.startsWith("/api/logbook/")) return json(res, [{ name: "Kitchen Light", message: "turned on", entity_id: "light.kitchen", when: now }]);
-      if (p === "/api/calendars") return json(res, [{ entity_id: "calendar.family", name: "Family" }]);
+      if (p === "/api/calendars") return calendarsLoaded ? json(res, [{ entity_id: "calendar.family", name: "Family" }]) : json(res, "404: Not Found", 404);
       if (p.startsWith("/api/calendars/")) return json(res, [{ summary: "Dinner", start: { dateTime: now }, end: { dateTime: now } }]);
-      if (p === "/api/error_log") {
-        res.writeHead(200, { "content-type": "text/plain" });
-        return res.end("line1\nline2\nline3");
-      }
       json(res, { message: "not found" }, 404);
+    });
+  });
+  // Fake HA websocket API (only what the server uses: auth + system_log/list)
+  const wss = new WebSocketServer({ noServer: true });
+  haServer.on("upgrade", (req, socket, head) => {
+    if (req.url !== "/api/websocket") return socket.destroy();
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.send(JSON.stringify({ type: "auth_required" }));
+      ws.on("message", (raw) => {
+        const msg = JSON.parse(raw.toString());
+        if (msg.type === "auth") {
+          ws.send(JSON.stringify({ type: msg.access_token === HA_TOKEN ? "auth_ok" : "auth_invalid" }));
+        } else if (msg.type === "system_log/list") {
+          ws.send(JSON.stringify({ id: msg.id, type: "result", success: true, result: [
+            { name: "homeassistant.components.zha", message: ["Device offline"], level: "WARNING", source: ["zha.py", 10], timestamp: 1000, first_occurred: 900, count: 3, exception: "" },
+            { name: "custom_components.foo", message: ["Setup failed"], level: "ERROR", source: ["foo.py", 5], timestamp: 2000, first_occurred: 2000, count: 1, exception: "Traceback..." },
+          ] }));
+        } else {
+          wsCommandsSeen.push(msg.type);
+          ws.send(JSON.stringify({ id: msg.id, type: "result", success: false, error: { message: "unexpected" } }));
+        }
+      });
     });
   });
   await new Promise((r) => haServer.listen(0, "127.0.0.1", r));
@@ -132,13 +154,30 @@ test("all tools work via bearer auth and none write", async () => {
   assert.match(await call("ha_get_logbook"), /turned on/);
   assert.match(await call("ha_list_calendars"), /calendar\.family/);
   assert.match(await call("ha_get_calendar_events", { entity_id: "calendar.family" }), /Dinner/);
-  assert.equal(await call("ha_get_error_log", { lines: 2 }), "line2\nline3");
+  const log = JSON.parse(await call("ha_get_error_log"));
+  assert.equal(log.total, 2);
+  assert.equal(log.entries[0].level, "ERROR", "newest first");
+  assert.equal(log.entries[0].exception, undefined, "no stack traces by default");
+  const warn = JSON.parse(await call("ha_get_error_log", { level: "WARNING" }));
+  assert.equal(warn.total, 1);
+  assert.equal(warn.entries[0].logger, "homeassistant.components.zha");
+  const withExc = JSON.parse(await call("ha_get_error_log", { search: "foo", include_exceptions: true }));
+  assert.equal(withExc.entries[0].exception, "Traceback...");
+
+  const unknownArea = await c.callTool({ name: "ha_list_entities", arguments: { area: "Nowhere" } });
+  assert.ok(unknownArea.isError);
+  assert.match(text(unknownArea), /Area 'Nowhere' not found/);
+
+  calendarsLoaded = false;
+  assert.match(await call("ha_list_calendars"), /No calendar integration/);
+  calendarsLoaded = true;
   assert.match(await call("ha_render_template", { template: "{{ 1 }}" }), /rendered/);
 
   const missing = await c.callTool({ name: "ha_get_state", arguments: { entity_ids: ["light.nope"] } });
   assert.match(text(missing), /404/);
 
   assert.deepEqual(writeAttempts, [], "server must never send write requests");
+  assert.deepEqual(wsCommandsSeen, [], "server must only send allowlisted websocket commands");
   await c.close();
 });
 

@@ -7,7 +7,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { HAClient } from "./ha-client.js";
 import { registerTools } from "./tools.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 function env(name: string, fallback?: string): string | undefined {
   const v = process.env[name];

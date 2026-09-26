@@ -8,7 +8,7 @@ A **read-only** [MCP](https://modelcontextprotocol.io) server for Home Assistant
    `https://github.com/m3yuval/ha-mcp-server`
 2. Install **Home Assistant MCP (read-only)** and start it.
 3. The **Log** tab shows your connector URL (`/mcp/<token>`).
-4. Expose port `3000` with a Cloudflare tunnel, lock it to Anthropic's IPs, and add it in claude.ai as a custom connector.
+4. Expose port `3000` with a Cloudflare tunnel, lock it to Anthropic's IPs (Access policy with action **Bypass**, or a WAF rule), and add it in claude.ai as a custom connector with **No sign-in**.
 
 Full steps: [`ha-mcp/DOCS.md`](ha-mcp/DOCS.md).
 
@@ -22,6 +22,7 @@ The HA client (`ha-mcp/src/ha-client.ts`) can only send:
 
 - `GET /api/*`
 - `POST /api/template` (renders a Jinja template — cannot change state)
+- websocket `system_log/list` (reads the error log)
 
 Anything else throws before it leaves the process, so there's no path to running actions, writing states, or firing events. The test suite also checks that no write request is ever sent.
 
@@ -38,7 +39,7 @@ Anything else throws before it leaves the process, so there's no path to running
 | `ha_get_history` | State changes over a time range |
 | `ha_get_logbook` | What happened and why |
 | `ha_list_calendars` / `ha_get_calendar_events` | Calendar entities and events |
-| `ha_get_error_log` | Tail of the HA error log |
+| `ha_get_error_log` | Recent errors/warnings (Settings → System → Logs), filter by level or text |
 | `ha_render_template` | Render a Jinja template (can be turned off) |
 
 ## Run outside Home Assistant
@@ -65,7 +66,7 @@ Local stdio for Claude Code / Claude Desktop:
 }
 ```
 
-Auth over HTTP: `Authorization: Bearer <MCP_AUTH_TOKEN>` or the token as the last path segment (`/mcp/<token>`, for claude.ai connectors which can't send headers).
+Auth over HTTP: `Authorization: Bearer <MCP_AUTH_TOKEN>` (claude.ai custom connectors can send this as a request header) or the token as the last path segment (`/mcp/<token>`).
 
 ## Development
 

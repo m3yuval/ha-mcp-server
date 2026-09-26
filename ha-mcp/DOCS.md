@@ -18,8 +18,11 @@ other request in code.
    add-on's storage. To use your own, set `auth_token` in Configuration.
 
 3. Expose port `3000` with Cloudflare (below).
-4. In claude.ai: **Settings → Connectors → Add custom connector** and paste the
-   URL with your real hostname.
+4. In claude.ai: **Customize → Connectors → + → Add custom connector**. Choose
+   **No sign-in**. Either:
+   - URL `https://<host>/mcp/<token>`, or
+   - URL `https://<host>/mcp` plus a request header `Authorization` =
+     `Bearer <token>` (keeps the secret out of the URL — recommended).
 
 ## Options
 
@@ -53,8 +56,16 @@ tunnel → Public hostname → Add**, service `HTTP`, URL `xxxxxxxx-ha-mcp:3000`
 
 claude.ai connector calls come from Anthropic's published range
 `160.79.104.0/21`
-([docs](https://platform.claude.com/docs/en/api/ip-addresses)). In Cloudflare:
-**Security → WAF → Custom rules → Create**, expression:
+([docs](https://platform.claude.com/docs/en/api/ip-addresses)). Two ways to
+lock the hostname to it:
+
+**Cloudflare Access** (Zero Trust → Access → Applications → your app → policy):
+Include **IP ranges** `160.79.104.0/21`, action **Bypass**. Not **Allow** —
+Allow still sends matching requests to the Access login page (you'll see a
+`302` when adding the connector), and a connector can't log in. Make sure there
+is no other Bypass/Everyone policy on the app.
+
+**Or a WAF rule** (Security → WAF → Custom rules):
 
 ```
 (http.host eq "ha-mcp.example.com" and not ip.src in {160.79.104.0/21})
@@ -62,11 +73,10 @@ claude.ai connector calls come from Anthropic's published range
 
 Action: **Block**.
 
-Don't put Cloudflare Access (login page) in front of it — the connector can't
-log in interactively. IP rule + secret URL is the combination to use.
+Either way, the auth token is still required on top.
 
 ## Check it works
 
-- `https://ha-mcp.example.com/health` → `{"ok":true,...}` (only from an allowed IP
-  once the WAF rule is on)
+- `https://ha-mcp.example.com/health` → `{"ok":true,...}` from an allowed IP;
+  `403` from anywhere else
 - In Claude, ask: "Using Home Assistant, which lights are on?"
