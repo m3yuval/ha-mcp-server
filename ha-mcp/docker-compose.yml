@@ -6,3 +6,7 @@ services:
     env_file: .env
     ports:
       - "3000:3000"
+    # For the config file tools: mount your HA config folder and set
+    # CONFIG_DIR=/homeassistant in .env
+    # volumes:
+    #   - /path/to/homeassistant/config:/homeassistant

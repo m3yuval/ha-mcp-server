@@ -1,0 +1,10 @@
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# s6-overlay service: start the MCP server.
+# with-contenv passes the container env (SUPERVISOR_TOKEN, or your own env when
+# run as plain Docker). The option -> env mapping lives in /usr/bin/ha-mcp-run
+# (plain sh + jq, testable without the Supervisor).
+# ==============================================================================
+bashio::log.info "Starting Home Assistant MCP server..."
+exec /usr/bin/ha-mcp-run

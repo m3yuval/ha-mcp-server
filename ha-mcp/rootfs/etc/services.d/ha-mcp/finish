@@ -1,0 +1,11 @@
+#!/usr/bin/env bashio
+# shellcheck shell=bash
+# ==============================================================================
+# s6-overlay service: the server stopped. Stop the container so the
+# Supervisor watchdog (or Docker's restart policy) can restart it.
+# ==============================================================================
+if [[ "${1}" -ne 0 ]] && [[ "${1}" -ne 256 ]]; then
+  bashio::log.warning "MCP server exited with code ${1}, stopping the add-on"
+  echo "${1}" > /run/s6-linux-init-container-results/exitcode
+fi
+exec /run/s6/basedir/bin/halt

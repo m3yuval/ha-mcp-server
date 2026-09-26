@@ -9,10 +9,36 @@ configuration:
     description: >-
       Leave empty to use the add-on's built-in Supervisor token. Set this only
       if you want the server to act as a specific (e.g. limited) HA user.
+  log_level:
+    name: Log level
+    description: >-
+      How much to log. At info, every request is logged (method, tool, client
+      IP, status, duration; never the token). Use warning to keep the log quiet.
   enable_template_tool:
     name: Enable template tool
     description: >-
       Allow Claude to render Jinja templates (read-only, but can see everything
       a template can see). Turn off to limit Claude to the fixed tools.
+  enable_actions:
+    name: Allow control of devices
+    description: >-
+      Allow Claude to call actions (services): turn lights on/off, set
+      thermostats, run scripts, etc. Off by default.
+  enable_config_files:
+    name: Allow editing config files
+    description: >-
+      Allow Claude to create and edit YAML files in your Home Assistant config
+      folder. Off by default. Make a backup first.
+  enable_management:
+    name: Allow managing Home Assistant
+    description: >-
+      Allow Claude to manage integrations, registries, automations, helpers,
+      add-ons, backups and updates, and to restart Home Assistant or the host.
+      Off by default.
+  blocked_domains:
+    name: Blocked domains
+    description: >-
+      Entity domains Claude can never control, even with control allowed.
+      Recommended: lock and alarm_control_panel.
 network:
   3000/tcp: MCP server port

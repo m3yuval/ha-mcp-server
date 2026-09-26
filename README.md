@@ -1,12 +1,14 @@
 # ha-mcp-server
 
-A **read-only** [MCP](https://modelcontextprotocol.io) server for Home Assistant, packaged as a Home Assistant add-on. Claude can look at your home — entities, areas, history, logbook, calendars — without being able to change anything.
+An [MCP](https://modelcontextprotocol.io) server for Home Assistant, packaged as a Home Assistant add-on. Claude can look at your home — entities, areas, history, logbook, calendars.
+
+**Read-only by default.** Controlling devices, editing config files and managing Home Assistant (add-ons, backups, updates, restarts) are separate switches, all off on a fresh install.
 
 ## Install as a Home Assistant add-on
 
 1. **Settings → Add-ons → Add-on store → ⋮ → Repositories**, add:
    `https://github.com/m3yuval/ha-mcp-server`
-2. Install **Home Assistant MCP (read-only)** and start it.
+2. Install **Home Assistant MCP** and start it.
 3. The **Log** tab shows your connector URL (`/mcp/<token>`).
 4. Expose port `3000` with a Cloudflare tunnel, lock it to Anthropic's IPs (Access policy with action **Bypass**, or a WAF rule), and add it in claude.ai as a custom connector with **No sign-in**.
 
@@ -16,7 +18,21 @@ Full steps: [`ha-mcp/DOCS.md`](ha-mcp/DOCS.md).
 
 Inside HA the add-on uses the Supervisor token, so you don't need to create a long-lived token.
 
-## Why it is read-only
+### Options
+
+| Option | Default | |
+|---|---|---|
+| `auth_token` / `ha_token` | empty | Connector secret (auto-generated) / optional long-lived token |
+| `log_level` | `info` | Every request is logged at `info`; use `warning` to quiet it |
+| `enable_template_tool` | `true` | Jinja template rendering (read-only) |
+| `enable_actions` | `false` | Control devices / call actions |
+| `enable_config_files` | `false` | Create/edit YAML in the HA config folder |
+| `enable_management` | `false` | Integrations, registries, automations, helpers, add-ons, backups, updates, restart |
+| `blocked_domains` | `[]` | Domains that can never be controlled — add `lock` and `alarm_control_panel` |
+
+What each switch unlocks, the add-on's permissions, and logging: [`ha-mcp/DOCS.md`](ha-mcp/DOCS.md).
+
+## Read-only by default
 
 The HA client (`ha-mcp/src/ha-client.ts`) can only send:
 
@@ -24,7 +40,7 @@ The HA client (`ha-mcp/src/ha-client.ts`) can only send:
 - `POST /api/template` (renders a Jinja template — cannot change state)
 - websocket `system_log/list` (reads the error log)
 
-Anything else throws before it leaves the process, so there's no path to running actions, writing states, or firing events. The test suite also checks that no write request is ever sent.
+With all switches off, anything else throws before it leaves the process, so there's no path to running actions, writing states, or firing events. The test suite also checks that no write request is ever sent. Each switch adds its own tools (Claude never sees tools for a switch that is off), and write tools are marked destructive so Claude asks before using them.
 
 ## Tools
 
@@ -42,13 +58,15 @@ Anything else throws before it leaves the process, so there's no path to running
 | `ha_get_error_log` | Recent errors/warnings (Settings → System → Logs), filter by level or text |
 | `ha_render_template` | Render a Jinja template (can be turned off) |
 
+More tools appear when you turn on `enable_actions`, `enable_config_files` or `enable_management`.
+
 ## Run outside Home Assistant
 
 The same image runs as plain Docker or Node — configure with env vars instead of add-on options:
 
 ```bash
 cd ha-mcp
-cp .env.example .env   # HA_URL, HA_TOKEN, MCP_AUTH_TOKEN
+cp .env.example .env   # HA_URL, HA_TOKEN, MCP_AUTH_TOKEN (+ optional ENABLE_* switches)
 docker compose up -d --build
 ```
 
@@ -72,13 +90,16 @@ Auth over HTTP: `Authorization: Bearer <MCP_AUTH_TOKEN>` (claude.ai custom conne
 
 ```bash
 cd ha-mcp
-npm ci && npm run build
-npm test      # starts a fake HA and calls every tool over MCP
+npm ci
+npm test      # builds, then starts a fake HA and calls every tool over MCP
 ```
+
+The add-on image is built from `ha-mcp/Dockerfile` (`docker build ha-mcp`). The add-on entrypoint is `ha-mcp/rootfs/usr/bin/ha-mcp-run` (plain `sh` + `jq`); it maps `/data/options.json` to the env vars above and can be tested outside HA with `DATA_DIR`, `APP_DIR` and `HA_CONFIG_MOUNT`. CI (`.github/workflows/ci.yaml`) runs the tests, the add-on linter, and a test build for amd64/aarch64.
 
 ## Roadmap
 
 - [x] Read-only tools
 - [x] Home Assistant add-on
-- [ ] Write actions (`call_service`) behind an allowlist of domains/entities
+- [x] Opt-in write capabilities (actions, config files, management) with blocked domains
+- [ ] Prebuilt multi-arch images (faster install than a local build)
 - [ ] OAuth for claude.ai instead of path token
