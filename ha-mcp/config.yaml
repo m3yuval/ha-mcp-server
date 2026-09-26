@@ -11,8 +11,6 @@ arch:
   - amd64
 # The HA base image runs s6-overlay v3 as its own init
 init: false
-startup: application
-boot: auto
 
 # Home Assistant Core API through the Supervisor proxy (http://supervisor/core)
 homeassistant_api: true
@@ -31,7 +29,6 @@ ports:
   3000/tcp: 3000
 ports_description:
   3000/tcp: MCP server (point your Cloudflare tunnel here)
-watchdog: "http://[HOST]:[PORT:3000]/health"
 
 options:
   log_level: info
