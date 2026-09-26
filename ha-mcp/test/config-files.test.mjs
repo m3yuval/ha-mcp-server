@@ -208,8 +208,10 @@ test(".storage: readable with redaction, auth refused, never writable", async ()
   const r = await srv.call("ha_read_config_file", { path: ".storage/core.config_entries" });
   assert.ok(!r.isError, r.text);
   assert.ok(!r.text.includes(STORAGE_TOKEN));
-  assert.match(r.json.content, /"access_token": "\*\*\*"/);
-  assert.match(r.json.content, /"host": "1\.2\.3\.4"/);
+  // config entry data/options values are hidden entirely (keys kept), domain kept
+  assert.match(r.json.content, /"access_token": "\*\*REDACTED\*\*"/);
+  assert.match(r.json.content, /"host": "\*\*REDACTED\*\*"/);
+  assert.match(r.json.content, /"domain": "demo"/);
   assert.equal(r.json.read_only, true);
   const a = await srv.call("ha_read_config_file", { path: ".storage/auth" });
   assert.ok(a.isError);
@@ -218,6 +220,277 @@ test(".storage: readable with redaction, auth refused, never writable", async ()
   assert.match(w.text, /\.storage/);
   const w2 = await srv.call("ha_write_config_file", { path: ".storage/new.json", content: "{}" });
   assert.ok(w2.isError);
+});
+
+// ------------------------------------------------------------------ credentials (M2)
+
+const MQTT_PW = "mqttPa55word!";
+const PRIV = "-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkq\\n-----END PRIVATE KEY-----\\n";
+const LTSK = "a1b2c3d4e5f6a7b8c9d0";
+const CLOUDHOOK = "https://hooks.nabu.casa/secret-hook-id";
+const Z2M = `homeassistant: true
+mqtt:
+  base_topic: zigbee2mqtt
+  server: mqtt://core-mosquitto:1883
+  user: addons
+  password: ${MQTT_PW}
+advanced:
+  network_key:
+    - 11
+    - 22
+    - 33
+    - 44
+    - 55
+    - 66
+    - 77
+    - 88
+  pan_id: 6754
+  log_level: info
+`;
+
+async function writeFixture(rel, content) {
+  await fs.mkdir(path.dirname(path.join(tmp, rel)), { recursive: true });
+  await fs.writeFile(path.join(tmp, rel), content);
+}
+
+test("M2: credential files are never read, written, deleted, restored or listed", async () => {
+  const denied = {
+    ".ssh/id_ed25519": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n",
+    ".ssh/config.yaml": "a: 1\n",
+    "id_rsa": "-----BEGIN RSA PRIVATE KEY-----\n",
+    "keys/id_ecdsa_backup": "x\n",
+    "SERVICE_ACCOUNT.json": JSON.stringify({ private_key: PRIV }),
+    "google/my-service_account-prod.json": JSON.stringify({ private_key: PRIV }),
+    "client_secret_123.json": "{}",
+    ".google.token": "{}",
+    ".cloud/cloud_creds.json": "{}",
+    "home-assistant.log": "token=abc\n",
+    "home-assistant.log.1": "x\n",
+    "zigbee2mqtt/database.db.backup": "x\n",
+    "ssl/privkey.pem": "-----BEGIN PRIVATE KEY-----\n",
+    "ssl/server.key": "-----BEGIN PRIVATE KEY-----\n",
+    ".env": "TOKEN=abc\n",
+  };
+  for (const [rel, content] of Object.entries(denied)) await writeFixture(rel, content);
+  await writeFixture("ssl/fullchain.crt", "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
+  await writeFixture(".ssh_notes.txt", "not the .ssh dir\n");
+  await writeFixture("id_rsa.pub", "ssh-ed25519 AAAA test\n");
+  try {
+    for (const rel of Object.keys(denied)) {
+      const r = await srv.call("ha_read_config_file", { path: rel });
+      assert.ok(r.isError, `read ${rel} should be refused: ${r.text}`);
+      assert.match(r.text, /Refusing/, rel);
+      const d = await srv.call("ha_delete_config_file", { path: rel });
+      assert.ok(d.isError, `delete ${rel} should be refused`);
+      const rs = await srv.call("ha_restore_config_backup", { path: rel });
+      assert.ok(rs.isError, `restore ${rel} should be refused`);
+    }
+    // writable extensions under denied names are still refused
+    for (const rel of ["SERVICE_ACCOUNT.json", "new_service_account.json", ".ssh/config.yaml", ".ssh/new.yaml", "credentials.json", "certs/x.pem"]) {
+      const w = await srv.call("ha_write_config_file", { path: rel, content: "{}" });
+      assert.ok(w.isError, `write ${rel} should be refused`);
+    }
+    assert.equal(await read("SERVICE_ACCOUNT.json"), denied["SERVICE_ACCOUNT.json"]);
+    // public material stays readable
+    for (const rel of ["ssl/fullchain.crt", "id_rsa.pub", ".ssh_notes.txt"]) {
+      const r = await srv.call("ha_read_config_file", { path: rel });
+      assert.ok(!r.isError, `${rel}: ${r.text}`);
+    }
+    const crtW = await srv.call("ha_write_config_file", { path: "ssl/fullchain.crt", content: "x" });
+    assert.ok(crtW.isError, "certificates are not writable");
+    // hidden from listings, even with include_system + include_all_text
+    const l = await srv.call("ha_list_config_files", { include_system: true, include_all_text: true, limit: 2000 });
+    const paths = l.json.files.map((f) => f.path);
+    for (const rel of Object.keys(denied)) assert.ok(!paths.includes(rel), `listed ${rel}`);
+    assert.ok(paths.includes(".ssh_notes.txt"));
+    assert.ok(!l.text.includes("PRIVATE KEY"));
+  } finally {
+    for (const rel of [...Object.keys(denied), "ssl/fullchain.crt", ".ssh_notes.txt", "id_rsa.pub"]) await fs.rm(path.join(tmp, rel), { force: true });
+  }
+});
+
+test("M2: .storage is an allowlist (read-only); HomeKit/cloud/auth files refused", async () => {
+  const files = {
+    ".storage/auth_provider.homeassistant": { data: { users: [{ password: "hash" }] } },
+    ".storage/onboarding": { data: { done: ["user"] } },
+    ".storage/http": { data: { ssl_key: "/ssl/key.pem" } },
+    ".storage/http.auth": { data: {} },
+    ".storage/homekit.01J.state": { data: { iOSDeviceLTSK: LTSK } },
+    ".storage/cloud": { data: { cloudhooks: { x: { cloudhook_url: CLOUDHOOK } } } },
+    ".storage/application_credentials": { data: { items: [{ client_secret: "cs" }] } },
+    ".storage/core.restore_state": { data: [] },
+    ".storage/lovelace.my_dash": { data: { config: { views: [{ cards: [{ type: "iframe", url: `https://u:${MQTT_PW}@cam/x` }] }] } } },
+    ".storage/person": { data: { items: [{ id: "p", name: "Pat", user_id: "u1" }] } },
+    ".storage/core.entity_registry": { data: { entities: [{ entity_id: "light.kitchen", options: { cloud: { webhook_id: "wh-secret-9" } } }] } },
+  };
+  for (const [rel, obj] of Object.entries(files)) await writeFixture(rel, JSON.stringify(obj));
+  try {
+    for (const rel of [".storage/auth", ".storage/auth_provider.homeassistant", ".storage/onboarding", ".storage/http", ".storage/http.auth",
+      ".storage/homekit.01J.state", ".storage/cloud", ".storage/application_credentials", ".storage/core.restore_state"]) {
+      const r = await srv.call("ha_read_config_file", { path: rel });
+      assert.ok(r.isError, `${rel} should be refused: ${r.text}`);
+      assert.match(r.text, /only these \.storage files are readable/);
+    }
+    const lv = await srv.call("ha_read_config_file", { path: ".storage/lovelace.my_dash" });
+    assert.ok(!lv.isError, lv.text);
+    assert.ok(!lv.text.includes(MQTT_PW), "URL password redacted");
+    const p = await srv.call("ha_read_config_file", { path: ".storage/person" });
+    assert.ok(!p.isError, p.text);
+    assert.match(p.json.content, /"name": "Pat"/);
+    const er = await srv.call("ha_read_config_file", { path: ".storage/core.entity_registry" });
+    assert.ok(!er.text.includes("wh-secret-9"));
+    assert.match(er.json.content, /"entity_id": "light\.kitchen"/);
+    // listing .storage only shows the allowlisted files
+    const l = await srv.call("ha_list_config_files", { path: ".storage" });
+    const paths = l.json.files.map((f) => f.path).sort();
+    assert.deepEqual(paths, [".storage/core.config_entries", ".storage/core.entity_registry", ".storage/lovelace.my_dash", ".storage/person"]);
+    const w = await srv.call("ha_write_config_file", { path: ".storage/person", content: "{}" });
+    assert.ok(w.isError);
+  } finally {
+    for (const rel of Object.keys(files)) await fs.rm(path.join(tmp, rel), { force: true });
+  }
+});
+
+test("M2: YAML/JSON reads redact secret keys; edits act on the real file; diffs stay masked", async () => {
+  await writeFixture("zigbee2mqtt/configuration.yaml", Z2M);
+  await writeFixture("zigbee2mqtt/secret.yaml", `z2m_pw: ${MQTT_PW}\n`);
+  await writeFixture("esphome/node.yaml", `api:\n  encryption:\n    key: "q83Kd9eL0xYzAbCdEfGhIjKlMnOpQrStUvWxYz01234="\nota:\n  - platform: esphome\n    password: ota-${MQTT_PW}\nwifi:\n  password: !secret wifi_key\n`);
+  await writeFixture("creds/google.json", JSON.stringify({ type: "x", private_key: PRIV, client_email: "a@b.c" }, null, 2) + "\n");
+  try {
+    const r = await srv.call("ha_read_config_file", { path: "zigbee2mqtt/configuration.yaml" });
+    assert.ok(!r.isError, r.text);
+    assert.ok(!r.text.includes(MQTT_PW), "mqtt password leaked");
+    assert.ok(!/- (11|22|33|44)\b/.test(r.json.content), "network key leaked");
+    assert.deepEqual(r.json.redacted_keys, ["password", "network_key"]);
+    assert.equal(r.json.redacted, true);
+    assert.match(r.json.note, /REDACTED/);
+    assert.equal(r.json.total_lines, Z2M.split("\n").length - 1, "line numbers preserved");
+    const lines = r.json.content.split("\n");
+    assert.equal(lines[5], '  password: "**REDACTED**"');
+    assert.equal(lines[16], "  pan_id: 6754");
+    assert.match(r.json.content, /user: addons/);
+    assert.equal(r.json.check.valid, true);
+
+    const e = await srv.call("ha_read_config_file", { path: "esphome/node.yaml" });
+    assert.ok(!e.text.includes("q83Kd9eL") && !e.text.includes(MQTT_PW), e.text);
+    assert.match(e.json.content, /wifi:\n  password: !secret wifi_key/, "!secret references are kept");
+    const j = await srv.call("ha_read_config_file", { path: "creds/google.json" });
+    assert.ok(!j.text.includes("PRIVATE KEY"), j.text);
+    assert.match(j.json.content, /"client_email": "a@b.c"/);
+    // Zigbee2MQTT secret.yaml: all values hidden, not writable
+    const s = await srv.call("ha_read_config_file", { path: "zigbee2mqtt/secret.yaml" });
+    assert.ok(!s.text.includes(MQTT_PW));
+    assert.deepEqual(s.json.secret_names, ["z2m_pw"]);
+    const sw = await srv.call("ha_write_config_file", { path: "zigbee2mqtt/secret.yaml", content: "a: b\n" });
+    assert.ok(sw.isError);
+
+    // str_replace on a non-secret line: works on the real content, secret kept on disk, diff masked
+    const ed = await srv.call("ha_edit_config_file", {
+      path: "zigbee2mqtt/configuration.yaml",
+      replacements: [{ old_string: "  log_level: info", new_string: "  log_level: debug" }],
+    });
+    assert.ok(!ed.isError, ed.text);
+    assert.ok(!ed.text.includes(MQTT_PW));
+    assert.match(ed.json.diff, /-  log_level: info\n\+  log_level: debug/);
+    assert.equal(await read("zigbee2mqtt/configuration.yaml"), Z2M.replace("log_level: info", "log_level: debug"));
+
+    // a replacement touching the secret line (disk text) works; diff shows only the placeholder
+    const NEWPW = "brandNewPw42";
+    const ed2 = await srv.call("ha_edit_config_file", {
+      path: "zigbee2mqtt/configuration.yaml",
+      replacements: [{ old_string: `password: ${MQTT_PW}`, new_string: `password: ${NEWPW}` }],
+      dry_run: true,
+    });
+    assert.ok(!ed2.isError, ed2.text);
+    assert.ok(!ed2.text.includes(MQTT_PW) && !ed2.text.includes(NEWPW), ed2.text);
+    assert.equal(ed2.json.diff, "");
+    assert.ok(ed2.json.note_redacted_change);
+    // yaml_operations on a secret key: new value never echoed
+    const op = await srv.call("ha_edit_config_file", {
+      path: "zigbee2mqtt/configuration.yaml",
+      yaml_operations: [{ path: "mqtt.password", value: NEWPW }, { path: "mqtt.client_id", value: "z2m" }],
+    });
+    assert.ok(!op.isError, op.text);
+    assert.ok(!op.text.includes(NEWPW) && !op.text.includes(MQTT_PW), op.text);
+    assert.match(op.json.diff, /\+  client_id: z2m/);
+    assert.match(await read("zigbee2mqtt/configuration.yaml"), new RegExp(`password: ${NEWPW}`));
+
+    // the placeholder is never written back
+    const rd = await srv.call("ha_read_config_file", { path: "zigbee2mqtt/configuration.yaml" });
+    const wb = await srv.call("ha_write_config_file", { path: "zigbee2mqtt/configuration.yaml", content: rd.json.content + "\n" });
+    assert.ok(wb.isError);
+    assert.match(wb.text, /placeholder/);
+    const ph = await srv.call("ha_edit_config_file", {
+      path: "zigbee2mqtt/configuration.yaml",
+      replacements: [{ old_string: '  password: "**REDACTED**"', new_string: "  password: x" }],
+    });
+    assert.ok(ph.isError);
+    assert.match(ph.text, /display placeholder/);
+    assert.match(await read("zigbee2mqtt/configuration.yaml"), new RegExp(`password: ${NEWPW}`));
+
+    // restore diffs are masked too
+    const rs = await srv.call("ha_restore_config_backup", { path: "zigbee2mqtt/configuration.yaml" });
+    assert.ok(!rs.isError, rs.text);
+    assert.ok(!rs.text.includes(NEWPW) && !rs.text.includes(MQTT_PW), rs.text);
+
+    // invalid JSON errors never quote file content
+    const bad = await srv.call("ha_write_config_file", { path: "creds/bad.json", content: `{"password": "${MQTT_PW}" x}` });
+    assert.ok(bad.isError);
+    assert.ok(!bad.text.includes(MQTT_PW), bad.text);
+  } finally {
+    for (const d of ["zigbee2mqtt", "esphome", "creds"]) await fs.rm(path.join(tmp, d), { recursive: true, force: true });
+  }
+});
+
+test("M2: redaction unit rules (line-preserving, !secret kept, URL passwords, other text files)", async () => {
+  const { redactForDisplay, isSecretKey } = await import("../dist/tools/config-files/redact.js");
+  const { sanitizeJsonError } = await import("../dist/tools/config-files/yaml-ha.js");
+  const y = "a:\n  token: |\n    line1\n    line2\n  api_key: !secret k\n  url: mqtt://u:pw9@h\n  keep: 1\n";
+  const r = redactForDisplay("structured", "x.yaml", y);
+  assert.equal(r.text.split("\n").length, y.split("\n").length);
+  assert.ok(!r.text.includes("line1") && !r.text.includes("pw9"));
+  assert.match(r.text, /api_key: !secret k/);
+  assert.match(r.text, /keep: 1/);
+  // YAML that does not parse falls back to line masking
+  const broken = redactForDisplay("structured", "x.yaml", "password: hunter2\nb: [\n");
+  assert.ok(!broken.text.includes("hunter2"));
+  const conf = redactForDisplay("text", "x.conf", "user = me\npassword = hunter2\n");
+  assert.ok(!conf.text.includes("hunter2") && conf.text.includes("user = me"));
+  assert.equal(isSecretKey("password_required", true), false);
+  assert.equal(isSecretKey("code", "1234"), false);
+  assert.equal(isSecretKey("key", "short"), false);
+  assert.equal(isSecretKey("key", "q83Kd9eL0xYzAbCdEfGhIjKlMnOp"), true);
+  assert.equal(isSecretKey("iOSDeviceLTSK", "abc"), true);
+  assert.equal(sanitizeJsonError(`Unexpected token 'x', "{"password": "hunter2" x}" is not valid JSON`).includes("hunter2"), false);
+});
+
+// ------------------------------------------------------------------ TOCTOU (L4)
+
+test("L4: atomicWrite re-checks the parent folder's real path (dir swapped for an escaping symlink)", async () => {
+  const { atomicWrite, assertRealDirInside } = await import("../dist/tools/config-files/sandbox.js");
+  const root = await fs.realpath(tmp);
+  const sub = path.join(root, "toctou");
+  await fs.mkdir(sub);
+  try {
+    assert.equal(await assertRealDirInside(root, sub, sub), sub);
+    await atomicWrite(path.join(sub, "ok.yaml"), "a: 1\n", undefined, root);
+    assert.equal(await read("toctou/ok.yaml"), "a: 1\n");
+    // swap the checked folder for a symlink pointing outside the config dir
+    await fs.rm(sub, { recursive: true });
+    await fs.symlink(outside, sub);
+    await assert.rejects(assertRealDirInside(root, sub, sub), /changed/);
+    await assert.rejects(atomicWrite(path.join(sub, "evil.yaml"), "pwned: 1\n", undefined, root), /changed|symlink/);
+    await assert.rejects(fs.stat(path.join(outside, "evil.yaml")));
+    assert.ok(!(await fs.readdir(outside)).some((f) => f.includes("ha-mcp-tmp")), "no temp file outside");
+    // a symlink inside the config dir that points to another inside folder is also refused (not the checked path)
+    await fs.rm(sub);
+    await fs.mkdir(path.join(root, "toctou_real"));
+    await fs.symlink(path.join(root, "toctou_real"), sub);
+    await assert.rejects(atomicWrite(path.join(sub, "x.yaml"), "a: 1\n", undefined, root), /changed/);
+  } finally {
+    await fs.rm(sub, { recursive: true, force: true });
+    await fs.rm(path.join(root, "toctou_real"), { recursive: true, force: true });
+  }
 });
 
 // ------------------------------------------------------------------ sandbox

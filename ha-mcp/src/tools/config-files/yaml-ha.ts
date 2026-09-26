@@ -5,7 +5,7 @@
  *     round-trips preserve them.
  *   - Edits use the `yaml` Document API, which keeps comments, quoting and
  *     key order.
- *   - secrets.yaml and .storage JSON can be redacted for display.
+ *   - secrets.yaml can be redacted for display (all other redaction: redact.ts).
  */
 import YAML, { isMap, isScalar, isSeq, Scalar, type Document, type Node } from "yaml";
 import path from "node:path";
@@ -103,6 +103,15 @@ function structuralWarnings(rel: string, doc: Document): Issue[] {
   return out;
 }
 
+/**
+ * V8's JSON.parse messages can quote a snippet of the input
+ * (`Unexpected token 'x', ..."password": "x"... is not valid JSON`); drop any
+ * quoted text so an error never echoes (possibly secret) file content.
+ */
+export function sanitizeJsonError(msg: string): string {
+  return msg.replace(/,\s*(\.\.\.)?".*"(\.\.\.)?\s+is not valid JSON/s, " (not valid JSON)").replace(/"[^"]*"/g, '"…"');
+}
+
 /** Validate text for a given file by extension. */
 export function validate(rel: string, text: string): Validation & { doc?: Document.Parsed } {
   if (/\.ya?ml$/i.test(rel)) {
@@ -115,7 +124,7 @@ export function validate(rel: string, text: string): Validation & { doc?: Docume
       if (text.trim() !== "") JSON.parse(text);
       return { valid: true, errors: [], warnings: [] };
     } catch (e) {
-      return { valid: false, errors: [{ message: `Invalid JSON: ${(e as Error).message}` }], warnings: [] };
+      return { valid: false, errors: [{ message: `Invalid JSON: ${sanitizeJsonError((e as Error).message)}` }], warnings: [] };
     }
   }
   return { valid: true, errors: [], warnings: [] };
@@ -149,22 +158,6 @@ export function secretNames(text: string): string[] {
   const doc = YAML.parseDocument(text, PARSE_OPTIONS);
   if (doc.errors.length || !isMap(doc.contents)) return [];
   return doc.contents.items.map((p) => String(isScalar(p.key) ? p.key.value : p.key));
-}
-
-const SECRET_JSON_KEY =
-  /token|password|passwd|secret|api_?key|apikey|private|jwt|credential|cookie|session|passphrase|psk|(^|_)key$|(^|_)pin(_code)?$|webhook_id/i;
-
-/** Deep-copy a JSON value replacing secret-looking keys' values with "***". */
-export function redactJson(v: unknown): unknown {
-  if (Array.isArray(v)) return v.map(redactJson);
-  if (v && typeof v === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v)) {
-      out[k] = SECRET_JSON_KEY.test(k) && val !== null && val !== "" ? "***" : redactJson(val);
-    }
-    return out;
-  }
-  return v;
 }
 
 // ------------------------------------------------------------- paths & edits
