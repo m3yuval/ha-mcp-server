@@ -1,0 +1,103 @@
+#!/bin/sh
+# ==============================================================================
+# Start the MCP server.
+#
+# Inside Home Assistant (add-on): maps /data/options.json to the env vars in
+# the ENV CONTRACT (src/config.ts), then starts the server.
+# Outside Home Assistant (plain Docker / Node): no options.json, so it just
+# starts the server with the environment as given.
+#
+# Plain POSIX sh + jq (no bashio) so it can be tested outside the add-on:
+#   DATA_DIR=/tmp/x APP_DIR=/tmp/app HA_CONFIG_MOUNT=/tmp/cfg ha-mcp-run
+# ==============================================================================
+set -e
+
+DATA_DIR="${DATA_DIR:-/data}"
+APP_DIR="${APP_DIR:-/app}"
+# Where the Supervisor mounts the HA config folder for `map: homeassistant_config`
+HA_CONFIG_MOUNT="${HA_CONFIG_MOUNT:-/homeassistant}"
+OPTS="$DATA_DIR/options.json"
+
+say() { echo "[ha-mcp] $*"; }
+
+# Value of an option as a string; "" when missing or null.
+opt() {
+  jq -r --arg k "$1" 'if has($k) and .[$k] != null then .[$k] | tostring else "" end' "$OPTS"
+}
+
+# true|false for a bool option, with a default when missing.
+opt_bool() {
+  v=$(opt "$1")
+  case "$v" in
+    true | false) echo "$v" ;;
+    *) echo "$2" ;;
+  esac
+}
+
+if [ -f "$OPTS" ]; then
+  say "Running as a Home Assistant add-on"
+
+  # --- Home Assistant Core API
+  LLAT=$(opt ha_token)
+  if [ -n "$LLAT" ]; then
+    export HA_URL="http://homeassistant:8123"
+    export HA_TOKEN="$LLAT"
+    say "Using the long-lived access token from the add-on options"
+  else
+    export HA_URL="http://supervisor/core"
+    export HA_TOKEN="${SUPERVISOR_TOKEN:-}"
+    say "Using the Supervisor token (no long-lived token needed)"
+  fi
+
+  # --- Supervisor API (add-ons, backups, host, updates)
+  export SUPERVISOR_URL="http://supervisor"
+  export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-}"
+
+  # --- HA config folder (map: homeassistant_config, read-write)
+  if [ -d "$HA_CONFIG_MOUNT" ]; then
+    export CONFIG_DIR="$HA_CONFIG_MOUNT"
+  else
+    export CONFIG_DIR=""
+  fi
+
+  # --- Auth token: from options, else generated once and kept in /data
+  TOKEN=$(opt auth_token)
+  if [ -z "$TOKEN" ]; then
+    if [ ! -s "$DATA_DIR/auth_token" ]; then
+      (umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DATA_DIR/auth_token")
+      say "Generated a new auth token (stored in the add-on's /data)"
+    fi
+    TOKEN=$(cat "$DATA_DIR/auth_token")
+  fi
+  export MCP_AUTH_TOKEN="$TOKEN"
+
+  # --- Capabilities (defaults keep a fresh install read-only)
+  ENABLE_TEMPLATE_TOOL=$(opt_bool enable_template_tool true)
+  ENABLE_ACTIONS=$(opt_bool enable_actions false)
+  ENABLE_CONFIG_FILES=$(opt_bool enable_config_files false)
+  ENABLE_MANAGEMENT=$(opt_bool enable_management false)
+  BLOCKED_DOMAINS=$(jq -r '(.blocked_domains // []) | map(tostring | ascii_downcase) | join(",")' "$OPTS")
+  export ENABLE_TEMPLATE_TOOL ENABLE_ACTIONS ENABLE_CONFIG_FILES ENABLE_MANAGEMENT BLOCKED_DOMAINS
+
+  LEVEL=$(opt log_level)
+  export LOG_LEVEL="${LEVEL:-info}"
+
+  export MCP_TRANSPORT=http
+  export PORT=3000
+  export HOST=0.0.0.0
+
+  say "------------------------------------------------------------"
+  say "claude.ai connector URL:  https://<your-cloudflare-host>/mcp/${TOKEN}"
+  say "Keep this URL secret. Set 'auth_token' in the options to change it."
+  say "------------------------------------------------------------"
+  if [ "$ENABLE_ACTIONS" = true ] || [ "$ENABLE_CONFIG_FILES" = true ] || [ "$ENABLE_MANAGEMENT" = true ]; then
+    say "WRITE ACCESS ENABLED: actions=$ENABLE_ACTIONS config_files=$ENABLE_CONFIG_FILES management=$ENABLE_MANAGEMENT"
+  else
+    say "Read-only mode (no write switches are on)"
+  fi
+  if [ -n "$BLOCKED_DOMAINS" ]; then
+    say "Blocked domains: $BLOCKED_DOMAINS"
+  fi
+fi
+
+exec node "$APP_DIR/dist/index.js"

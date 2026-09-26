@@ -1,5 +1,12 @@
 node_modules
 dist
 .env
+.env.example
 .git
 test
+docker-compose.yml
+*.md
+*.png
+apparmor.txt
+config.yaml
+translations

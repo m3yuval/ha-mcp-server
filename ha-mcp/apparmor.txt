@@ -1,0 +1,50 @@
+#include <tunables/global>
+
+# Based on the profile in https://developers.home-assistant.io/docs/apps/presentation#apparmor
+# and https://github.com/home-assistant/apps-example (s6-overlay v3 + bashio).
+profile ha-mcp flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Capabilities
+  file,
+  signal (send) set=(kill,term,int,hup,cont),
+
+  # Network: HTTP server on :3000, HTTP + websocket to the Supervisor / Core, DNS
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  network unix,
+
+  # S6-Overlay
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /run/{,**} rwk,
+  /dev/tty rw,
+
+  # Bashio
+  /usr/lib/bashio/** ix,
+  /tmp/** rwk,
+
+  # Node.js and the app
+  /usr/bin/node ix,
+  /usr/lib/** mr,
+  /app/** r,
+  /proc/** r,
+  /sys/fs/cgroup/** r,
+  /etc/ssl/** r,
+
+  # options.json and the generated auth token
+  /data/** rw,
+
+  # Home Assistant config folder (map: homeassistant_config, read-write)
+  /homeassistant/ r,
+  /homeassistant/** rwl,
+}

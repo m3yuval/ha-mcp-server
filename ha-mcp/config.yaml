@@ -1,25 +1,52 @@
-name: Home Assistant MCP (read-only)
+# https://developers.home-assistant.io/docs/apps/configuration#app-configuration
+name: Home Assistant MCP
 version: "0.1.1"
 slug: ha-mcp
-description: Read-only MCP server so Claude can look at your home (entities, areas, history, logbook) without changing anything
-url: "https://github.com/m3yuval/ha-mcp-server"
+description: >-
+  MCP server so Claude can see your home (entities, areas, history, logbook).
+  Read-only by default; control, config files and management are opt-in.
+url: "https://github.com/m3yuval/ha-mcp-server/tree/main/ha-mcp"
 arch:
   - aarch64
   - amd64
-init: true
+# The HA base image runs s6-overlay v3 as its own init
+init: false
 startup: application
 boot: auto
+
+# Home Assistant Core API through the Supervisor proxy (http://supervisor/core)
 homeassistant_api: true
+# Supervisor API for the management tools (add-ons, backups, host, updates).
+# The server refuses these calls unless `enable_management` is on.
+hassio_api: true
+hassio_role: manager
+
+# HA config folder at /homeassistant, read-write for the config file tools
+# (the server only writes there when `enable_config_files` is on)
+map:
+  - type: homeassistant_config
+    read_only: false
+
 ports:
   3000/tcp: 3000
 ports_description:
   3000/tcp: MCP server (point your Cloudflare tunnel here)
 watchdog: "http://[HOST]:[PORT:3000]/health"
+
 options:
-  auth_token: ""
-  ha_token: ""
+  log_level: info
   enable_template_tool: true
+  enable_actions: false
+  enable_config_files: false
+  enable_management: false
+  blocked_domains: []
 schema:
   auth_token: "password?"
   ha_token: "password?"
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
   enable_template_tool: bool
+  enable_actions: bool
+  enable_config_files: bool
+  enable_management: bool
+  blocked_domains:
+    - "match(^[a-z0-9_]+$)"
