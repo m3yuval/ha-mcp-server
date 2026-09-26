@@ -1,74 +1,21 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { HAClient, HAError } from "./ha-client.js";
+import { HAError } from "../ha-client.js";
+import {
+  READ_ONLY,
+  compactState,
+  defineTool,
+  isoHoursAgo,
+  jinjaStr,
+  renderJson,
+  type HAState,
+  type ToolContext,
+} from "./common.js";
 
-/** Max characters returned by a single tool call, to keep responses usable. */
-const MAX_OUTPUT_CHARS = 60_000;
-
-interface HAState {
-  entity_id: string;
-  state: string;
-  attributes: Record<string, unknown>;
-  last_changed: string;
-  last_updated: string;
-}
-
-const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-
-function ok(data: unknown) {
-  let text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
-  if (text.length > MAX_OUTPUT_CHARS) {
-    text = text.slice(0, MAX_OUTPUT_CHARS) + `\n\n…[truncated ${text.length - MAX_OUTPUT_CHARS} chars — narrow the query]`;
-  }
-  return { content: [{ type: "text" as const, text }] };
-}
-
-function fail(err: unknown) {
-  const msg = err instanceof HAError || err instanceof Error ? err.message : String(err);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
-
-/** Wrap a handler so thrown errors become MCP tool errors instead of protocol errors. */
-function safe<A>(fn: (args: A) => Promise<unknown>) {
-  return async (args: A) => {
-    try {
-      return ok(await fn(args));
-    } catch (err) {
-      return fail(err);
-    }
-  };
-}
-
-function compactState(s: HAState) {
-  const a = s.attributes ?? {};
-  const out: Record<string, unknown> = { entity_id: s.entity_id, state: s.state };
-  if (a.friendly_name) out.name = a.friendly_name;
-  if (a.unit_of_measurement) out.unit = a.unit_of_measurement;
-  if (a.device_class) out.device_class = a.device_class;
-  out.last_changed = s.last_changed;
-  return out;
-}
-
-function isoHoursAgo(h: number) {
-  return new Date(Date.now() - h * 3600_000).toISOString();
-}
-
-async function renderJson<T>(ha: HAClient, template: string): Promise<T> {
-  const raw = await ha.renderTemplate(template);
-  try {
-    return JSON.parse(typeof raw === "string" ? raw : JSON.stringify(raw)) as T;
-  } catch {
-    throw new HAError(`Unexpected template output: ${String(raw).slice(0, 200)}`);
-  }
-}
-
-/** Escape a value for safe use inside a single-quoted Jinja string literal. */
-function jinjaStr(v: string) {
-  return v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-
-export function registerTools(server: McpServer, ha: HAClient, opts: { enableTemplateTool: boolean }) {
-  server.registerTool(
+/** Read-only tools. Always registered. */
+export function registerReadTools(ctx: ToolContext) {
+  const { ha } = ctx;
+  defineTool(
+    ctx,
     "ha_get_config",
     {
       title: "Get Home Assistant config",
@@ -77,7 +24,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       inputSchema: {},
       annotations: READ_ONLY,
     },
-    safe(async () => {
+    (async () => {
       const c = await ha.get<Record<string, any>>("/api/config");
       return {
         version: c.version,
@@ -94,7 +41,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_list_domains",
     {
       title: "List entity domains",
@@ -103,7 +51,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       inputSchema: {},
       annotations: READ_ONLY,
     },
-    safe(async () => {
+    (async () => {
       const states = await ha.get<HAState[]>("/api/states");
       const counts: Record<string, number> = {};
       for (const s of states) {
@@ -114,7 +62,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_list_entities",
     {
       title: "List entities",
@@ -129,7 +78,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ domain, area, search, state, limit }) => {
+    (async ({ domain, area, search, state, limit }) => {
       let states = await ha.get<HAState[]>("/api/states");
       if (domain) states = states.filter((s) => s.entity_id.startsWith(domain + "."));
       if (state) states = states.filter((s) => s.state === state);
@@ -159,7 +108,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_get_state",
     {
       title: "Get entity state",
@@ -170,9 +120,9 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ entity_ids }) => {
+    (async ({ entity_ids }) => {
       const results = await Promise.all(
-        entity_ids.map(async (id) => {
+        entity_ids.map(async (id: string) => {
           try {
             return await ha.get<HAState>(`/api/states/${encodeURIComponent(id)}`);
           } catch (err) {
@@ -184,7 +134,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_list_areas",
     {
       title: "List areas",
@@ -194,7 +145,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ include_entities }) => {
+    (async ({ include_entities }) => {
       const tpl = include_entities
         ? "{% set ns = namespace(o=[]) %}{% for a in areas() %}{% set ns.o = ns.o + [{'id': a, 'name': area_name(a), 'entities': area_entities(a)}] %}{% endfor %}{{ ns.o | tojson }}"
         : "{% set ns = namespace(o=[]) %}{% for a in areas() %}{% set ns.o = ns.o + [{'id': a, 'name': area_name(a), 'entity_count': area_entities(a) | count}] %}{% endfor %}{{ ns.o | tojson }}";
@@ -202,7 +153,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_list_services",
     {
       title: "List available actions (services)",
@@ -213,7 +165,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ domain }) => {
+    (async ({ domain }) => {
       const all = await ha.get<{ domain: string; services: Record<string, any> }[]>("/api/services");
       if (!domain) {
         return Object.fromEntries(all.map((d) => [d.domain, Object.keys(d.services)]));
@@ -238,7 +190,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_get_history",
     {
       title: "Get entity history",
@@ -253,7 +206,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ entity_ids, start_time, end_time, hours, max_points }) => {
+    (async ({ entity_ids, start_time, end_time, hours, max_points }) => {
       const start = start_time ?? isoHoursAgo(hours ?? 24);
       const data = await ha.get<HAState[][]>(`/api/history/period/${encodeURIComponent(start)}`, {
         filter_entity_id: entity_ids.join(","),
@@ -276,7 +229,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_get_logbook",
     {
       title: "Get logbook",
@@ -291,7 +245,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ entity_id, start_time, end_time, hours, limit }) => {
+    (async ({ entity_id, start_time, end_time, hours, limit }) => {
       const start = start_time ?? isoHoursAgo(hours ?? 24);
       const entries = await ha.get<any[]>(`/api/logbook/${encodeURIComponent(start)}`, {
         entity: entity_id,
@@ -301,7 +255,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_list_calendars",
     {
       title: "List calendars",
@@ -309,7 +264,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       inputSchema: {},
       annotations: READ_ONLY,
     },
-    safe(async () => {
+    (async () => {
       try {
         return await ha.get("/api/calendars");
       } catch (err) {
@@ -322,7 +277,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_get_calendar_events",
     {
       title: "Get calendar events",
@@ -334,7 +290,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ entity_id, start, end }) => {
+    (async ({ entity_id, start, end }) => {
       const s = start ?? new Date().toISOString();
       const e = end ?? new Date(new Date(s).getTime() + 7 * 86400_000).toISOString();
       try {
@@ -348,7 +304,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  server.registerTool(
+  defineTool(
+    ctx,
     "ha_get_error_log",
     {
       title: "Get error log",
@@ -365,8 +322,8 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
       },
       annotations: READ_ONLY,
     },
-    safe(async ({ level, search, limit, include_exceptions }) => {
-      let entries = await ha.wsCommand<any[]>("system_log/list");
+    (async ({ level, search, limit, include_exceptions }) => {
+      let entries = await ha.wsRead<any[]>("system_log/list");
       if (level) entries = entries.filter((e) => e.level === level);
       if (search) {
         const q = search.toLowerCase();
@@ -393,8 +350,9 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
     }),
   );
 
-  if (opts.enableTemplateTool) {
-    server.registerTool(
+  if (ctx.config.enableTemplateTool) {
+    defineTool(
+      ctx,
       "ha_render_template",
       {
         title: "Render a template",
@@ -405,7 +363,7 @@ export function registerTools(server: McpServer, ha: HAClient, opts: { enableTem
         },
         annotations: READ_ONLY,
       },
-      safe(async ({ template }) => ha.renderTemplate(template)),
+      (async ({ template }) => ha.renderTemplate(template)),
     );
   }
 }
