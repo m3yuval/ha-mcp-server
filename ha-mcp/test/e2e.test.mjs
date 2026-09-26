@@ -47,7 +47,7 @@ before(async () => {
         return json(res, { message: "write!" }, 200);
       }
       const p = url.pathname;
-      if (p === "/api/config") return json(res, { version: "2026.9.0", location_name: "Home", time_zone: "Asia/Jerusalem", components: ["a", "b"], state: "RUNNING" });
+      if (p === "/api/config") return json(res, { version: "2026.9.0", location_name: "Home", time_zone: "UTC", components: ["a", "b"], state: "RUNNING" });
       if (p === "/api/states") return json(res, states);
       if (p.startsWith("/api/states/")) {
         const s = states.find((x) => x.entity_id === decodeURIComponent(p.slice(12)));
