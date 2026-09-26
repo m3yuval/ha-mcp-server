@@ -1,0 +1,18 @@
+configuration:
+  auth_token:
+    name: MCP auth token
+    description: >-
+      Secret that goes in the connector URL (https://host/mcp/<token>).
+      Leave empty to auto-generate one; it is printed in the add-on log on start.
+  ha_token:
+    name: Long-lived access token (optional)
+    description: >-
+      Leave empty to use the add-on's built-in Supervisor token. Set this only
+      if you want the server to act as a specific (e.g. limited) HA user.
+  enable_template_tool:
+    name: Enable template tool
+    description: >-
+      Allow Claude to render Jinja templates (read-only, but can see everything
+      a template can see). Turn off to limit Claude to the fixed tools.
+network:
+  3000/tcp: MCP server port

@@ -132,6 +132,14 @@ async function runHttp() {
   });
 }
 
+// Exit cleanly on stop (Docker / HA Supervisor send SIGTERM).
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  process.on(sig, () => {
+    console.error(`Received ${sig}, shutting down`);
+    process.exit(0);
+  });
+}
+
 if (config.transport === "stdio") {
   runStdio().catch((err) => {
     console.error(err);

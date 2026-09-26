@@ -1,0 +1,25 @@
+name: Home Assistant MCP (read-only)
+version: "0.1.0"
+slug: ha-mcp
+description: Read-only MCP server so Claude can look at your home (entities, areas, history, logbook) without changing anything
+url: "https://github.com/m3yuval/ha-mcp-server"
+arch:
+  - aarch64
+  - amd64
+init: true
+startup: application
+boot: auto
+homeassistant_api: true
+ports:
+  3000/tcp: 3000
+ports_description:
+  3000/tcp: MCP server (point your Cloudflare tunnel here)
+watchdog: "http://[HOST]:[PORT:3000]/health"
+options:
+  auth_token: ""
+  ha_token: ""
+  enable_template_tool: true
+schema:
+  auth_token: "password?"
+  ha_token: "password?"
+  enable_template_tool: bool
