@@ -34,13 +34,13 @@ What each switch unlocks, the add-on's permissions, and logging: [`ha-mcp/DOCS.m
 
 ## Read-only by default
 
-The HA client (`ha-mcp/src/ha-client.ts`) can only send:
-
-- `GET /api/*`
-- `POST /api/template` (renders a Jinja template — cannot change state)
-- websocket `system_log/list` (reads the error log)
-
-With all switches off, anything else throws before it leaves the process, so there's no path to running actions, writing states, or firing events. The test suite also checks that no write request is ever sent. Each switch adds its own tools (Claude never sees tools for a switch that is off), and write tools are marked destructive so Claude asks before using them.
+With every switch off, the server can only read: GET requests, template
+rendering (with a time limit), and an allowlist of read-only websocket
+commands. Anything else is refused inside the HA client before a request is
+sent, and tests check that no write request is ever made. Each switch adds its
+own tools (Claude never sees tools for a switch that is off); system actions
+like restarting HA are never reachable from `enable_actions`, and risky tools
+require an explicit confirmation. Details: [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## Tools
 
@@ -58,7 +58,7 @@ With all switches off, anything else throws before it leaves the process, so the
 | `ha_get_error_log` | Recent errors/warnings (Settings → System → Logs), filter by level or text |
 | `ha_render_template` | Render a Jinja template (can be turned off) |
 
-More tools appear when you turn on `enable_actions`, `enable_config_files` or `enable_management`.
+More tools appear when you turn on `enable_actions`, `enable_config_files` or `enable_management` — 94 in total. Full list: [`docs/TOOLS.md`](docs/TOOLS.md).
 
 ## Run outside Home Assistant
 
@@ -87,6 +87,10 @@ Local stdio for Claude Code / Claude Desktop:
 Auth over HTTP: `Authorization: Bearer <MCP_AUTH_TOKEN>` (claude.ai custom connectors can send this as a request header) or the token as the last path segment (`/mcp/<token>`).
 
 ## Development
+
+Start with [`AGENTS.md`](AGENTS.md) (repo map, rules, commands), then
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/SECURITY.md`](docs/SECURITY.md),
+[`docs/TESTING.md`](docs/TESTING.md) and [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ```bash
 cd ha-mcp

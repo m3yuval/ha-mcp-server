@@ -9,7 +9,7 @@ import { HAClient } from "./ha-client.js";
 import { log, setLogLevel } from "./logger.js";
 import { registerAllTools } from "./tools/index.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
 
 const config = loadConfig();
 setLogLevel(config.logLevel);
@@ -122,7 +122,8 @@ async function runHttp() {
   });
 
   app.get("/health", (_req, res) => {
-    res.json({ ok: true, version: VERSION });
+    // no-store: proxies/CDNs (e.g. Cloudflare) must not serve a stale version
+    res.set("Cache-Control", "no-store").json({ ok: true, version: VERSION });
   });
 
   // Auth: "Authorization: Bearer <token>" header, or the token as the last path

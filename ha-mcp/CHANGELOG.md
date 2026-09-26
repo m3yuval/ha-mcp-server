@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+- `/health` sends `Cache-Control: no-store`, so a proxy/CDN in front of the
+  add-on can't report a stale version.
+- Repo docs for contributors and AI agents (`AGENTS.md`, `docs/`), including a
+  generated tool catalog.
+
 ## 0.2.0
 
 New capabilities (each behind its own switch, all off by default):
