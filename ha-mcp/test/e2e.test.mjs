@@ -10,7 +10,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { WebSocketServer } from "ws";
 
 const HA_TOKEN = "test-ha-token";
-const MCP_TOKEN = "test-mcp-token";
+const MCP_TOKEN = "test-mcp-token-0123456789abcdef0123456789";
 const MCP_PORT = 39123;
 const writeAttempts = [];
 const wsCommandsSeen = [];

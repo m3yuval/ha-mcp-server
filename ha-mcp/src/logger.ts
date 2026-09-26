@@ -16,7 +16,9 @@ export function setLogLevel(level: string) {
 function write(level: Level, msg: string) {
   if (LEVELS.indexOf(level) < threshold) return;
   const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
-  process.stderr.write(`${ts} ${level.toUpperCase().padEnd(7)} ${msg}\n`);
+  // One event = one line: control characters (newlines etc.) can't forge extra log lines.
+  const clean = msg.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (c) => (c === "\n" ? "⏎" : "�"));
+  process.stderr.write(`${ts} ${level.toUpperCase().padEnd(7)} ${clean}\n`);
 }
 
 export const log = {
@@ -28,7 +30,9 @@ export const log = {
   error: (m: string) => write("error", m),
 };
 
-const SECRET_KEY = /token|password|passwd|secret|api_?key|authorization|credential/i;
+// Argument names whose values are never logged. `code`/`pin` cover alarm and lock codes.
+const SECRET_KEY =
+  /token|password|passwd|passphrase|secret|api_?key|authorization|credential|private|psk|webhook|cookie|bearer|^(code|pin|pin_code|pass)$|_code$|_pin$/i;
 
 /** Compact, secret-redacted one-line JSON for logs. */
 export function summarize(value: unknown, max = 300): string {

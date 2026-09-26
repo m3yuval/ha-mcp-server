@@ -62,14 +62,19 @@ if [ -f "$OPTS" ]; then
 
   # --- Auth token: from options, else generated once and kept in /data
   TOKEN=$(opt auth_token)
+  NEW_TOKEN=false
   if [ -z "$TOKEN" ]; then
     if [ ! -s "$DATA_DIR/auth_token" ]; then
       (umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DATA_DIR/auth_token")
+      NEW_TOKEN=true
       say "Generated a new auth token (stored in the add-on's /data)"
     fi
     TOKEN=$(cat "$DATA_DIR/auth_token")
   fi
   export MCP_AUTH_TOKEN="$TOKEN"
+  # The full token is printed only once, when it is generated. After that the
+  # log shows a masked form, so it doesn't sit in every restart's log.
+  MASKED="$(printf '%s' "$TOKEN" | cut -c1-6)...($(printf '%s' "$TOKEN" | wc -c | tr -d ' ') chars)"
 
   # --- Capabilities (defaults keep a fresh install read-only)
   ENABLE_TEMPLATE_TOOL=$(opt_bool enable_template_tool true)
@@ -87,8 +92,15 @@ if [ -f "$OPTS" ]; then
   export HOST=0.0.0.0
 
   say "------------------------------------------------------------"
-  say "claude.ai connector URL:  https://<your-cloudflare-host>/mcp/${TOKEN}"
-  say "Keep this URL secret. Set 'auth_token' in the options to change it."
+  if [ "$NEW_TOKEN" = true ]; then
+    say "claude.ai connector URL:  https://<your-cloudflare-host>/mcp/${TOKEN}"
+    say "  or URL https://<your-cloudflare-host>/mcp with header"
+    say "  Authorization: Bearer ${TOKEN}"
+    say "This is shown ONCE. Save it now; later logs show it masked."
+  else
+    say "Auth token: ${MASKED}"
+    say "Lost it? Set a new 'auth_token' in Configuration (openssl rand -hex 32)."
+  fi
   say "------------------------------------------------------------"
   if [ "$ENABLE_ACTIONS" = true ] || [ "$ENABLE_CONFIG_FILES" = true ] || [ "$ENABLE_MANAGEMENT" = true ]; then
     say "WRITE ACCESS ENABLED: actions=$ENABLE_ACTIONS config_files=$ENABLE_CONFIG_FILES management=$ENABLE_MANAGEMENT"

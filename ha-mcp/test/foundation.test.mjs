@@ -102,3 +102,45 @@ test("bulky arguments (file contents) are logged as a size, not as text", async 
     await srv.stop();
   }
 });
+
+test("security: log injection, case-variant token path, unauthenticated bodies, short tokens", async () => {
+  const srv = await startMcp({ fake });
+  try {
+    // 1. Crafted tool name / method with newlines can't forge log lines
+    await fetch(`${srv.url}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${MCP_TOKEN}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "x\n2026-01-01 00:00:00 INFO    tool ha_host_power {} -> ok", arguments: {} } }),
+    });
+    // 2. Upper-case path with the real token: must not authenticate via a route, and must not log the token
+    const upper = await fetch(`${srv.url}/MCP/${MCP_TOKEN}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    assert.notEqual(upper.status, 200);
+    // 3. Unauthenticated body is not parsed/described
+    await fetch(`${srv.url}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "UNAUTH_MARKER" }),
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    const out = srv.logs.join("");
+    const forged = out.split("\n").filter((l) => /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d INFO\s+tool ha_host_power/.test(l));
+    assert.equal(forged.length, 0, "a forged log line was written:\n" + out);
+    assert.ok(!out.includes(MCP_TOKEN), "token leaked into logs:\n" + out);
+    assert.ok(!out.includes("UNAUTH_MARKER"), "unauthenticated body was described in logs");
+  } finally {
+    await srv.stop();
+  }
+  // 4. Tokens shorter than 32 chars are refused at startup
+  await assert.rejects(() => startMcp({ fake, env: { MCP_AUTH_TOKEN: "short-token" } }), /too short/);
+});
+
+test("logger redacts alarm/lock codes and other secret-ish argument names", async () => {
+  const { summarize } = await import("../dist/logger.js");
+  const s = summarize({ code: "1234", pin: "9999", alarm_code: "1", wifi_psk: "p", private_key: "k", webhook_id: "w", passphrase: "x", entity_id: "alarm.home" });
+  for (const secret of ['"1234"', '"9999"', '"1"', '"p"', '"k"', '"w"', '"x"']) assert.ok(!s.includes(secret), s);
+  assert.match(s, /alarm\.home/);
+});

@@ -63,6 +63,15 @@ export function loadConfig(): Config {
   if (bool("ENABLE_CONFIG_FILES", false)) capabilities.add("config");
   if (bool("ENABLE_MANAGEMENT", false)) capabilities.add("management");
 
+  const authToken = env("MCP_AUTH_TOKEN");
+  if (authToken && authToken.length < 32) {
+    console.error(
+      "MCP_AUTH_TOKEN is too short (minimum 32 characters). It is the main protection for this server. " +
+        "Generate one with: openssl rand -hex 32",
+    );
+    process.exit(1);
+  }
+
   return {
     haUrl,
     haToken,
@@ -72,7 +81,7 @@ export function loadConfig(): Config {
     transport: env("MCP_TRANSPORT", "http") as "http" | "stdio",
     port: Number(env("PORT", "3000")),
     host: env("HOST", "0.0.0.0")!,
-    authToken: env("MCP_AUTH_TOKEN"),
+    authToken,
     allowNoAuth: bool("ALLOW_NO_AUTH", false),
     enableTemplateTool: bool("ENABLE_TEMPLATE_TOOL", true),
     capabilities,

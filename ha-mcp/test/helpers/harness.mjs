@@ -35,7 +35,7 @@ const DIST = path.resolve(here, "../../dist/index.js");
 
 export const HA_TOKEN = "test-ha-token";
 export const SUP_TOKEN = "test-supervisor-token";
-export const MCP_TOKEN = "test-mcp-token";
+export const MCP_TOKEN = "test-mcp-token-0123456789abcdef0123456789";
 
 export function reply(status, body) {
   return { __reply: true, status, body };

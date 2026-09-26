@@ -66,14 +66,26 @@ function clientIp(req: Request) {
   return String(cf ?? (typeof xff === "string" ? xff.split(",")[0].trim() : undefined) ?? req.socket.remoteAddress ?? "?");
 }
 
+/** Client-controlled text for the log: printable, no spaces/newlines, capped. */
+function logSafe(v: unknown, max = 64): string {
+  const s = typeof v === "string" ? v : "?";
+  const clean = s.replace(/[^A-Za-z0-9_./:-]/g, "_");
+  return clean.length > max ? clean.slice(0, max) + "…" : clean || "?";
+}
+
 /** Describe a JSON-RPC body for the log: "tools/call ha_get_state", "initialize", ... */
 function describeRpc(body: unknown): string {
   const one = (m: any) => {
     if (!m || typeof m !== "object") return "?";
-    if (m.method === "tools/call") return `tools/call ${m.params?.name ?? "?"}`;
-    return m.method ?? (m.result !== undefined || m.error !== undefined ? "response" : "?");
+    if (m.method === "tools/call") return `tools/call ${logSafe(m.params?.name)}`;
+    if (typeof m.method === "string") return logSafe(m.method);
+    return m.result !== undefined || m.error !== undefined ? "response" : "?";
   };
-  return Array.isArray(body) ? `batch[${body.map(one).join(", ")}]` : one(body);
+  if (Array.isArray(body)) {
+    const items = body.slice(0, 10).map(one);
+    return `batch[${items.join(", ")}${body.length > 10 ? `, +${body.length - 10}` : ""}]`;
+  }
+  return one(body);
 }
 
 async function runHttp() {
@@ -88,17 +100,20 @@ async function runHttp() {
 
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", true);
-  app.use(express.json({ limit: "5mb" }));
+  // /MCP/<token> must not match /mcp/:token (it would dodge the log redaction)
+  app.set("case sensitive routing", true);
+  app.set("strict routing", false);
 
   // One INFO line per request: method, redacted path, JSON-RPC method/tool,
   // client IP, status and duration. The auth token in the path is never logged.
   app.use((req, res, next) => {
     const started = Date.now();
     res.on("finish", () => {
-      const path = req.path.replace(/^\/mcp\/[^/]+/, "/mcp/***");
-      const rpc = req.method === "POST" && req.body ? ` ${describeRpc(req.body)}` : "";
-      const line = `${req.method} ${path}${rpc} from ${clientIp(req)} -> ${res.statusCode} (${Date.now() - started}ms)`;
+      // Redact anything after /mcp/ regardless of case; never log other raw paths in full.
+      const path = /^\/mcp\//i.test(req.path) ? "/mcp/***" : logSafe(req.path, 80);
+      // Body is only parsed (and described) after successful auth.
+      const rpc = res.locals.authed && req.body ? ` ${describeRpc(req.body)}` : "";
+      const line = `${logSafe(req.method, 8)} ${path}${rpc} from ${logSafe(clientIp(req), 45)} -> ${res.statusCode} (${Date.now() - started}ms)`;
       if (path === "/health") log.debug(line);
       else if (res.statusCode === 401) log.warning(line);
       else log.info(line);
@@ -113,12 +128,16 @@ async function runHttp() {
   // Auth: "Authorization: Bearer <token>" header, or the token as the last path
   // segment (/mcp/<token>).
   const auth = (req: Request, res: Response, next: NextFunction) => {
-    if (!config.authToken) return next();
+    const pass = () => {
+      res.locals.authed = true;
+      next();
+    };
+    if (!config.authToken) return pass();
     const header = req.headers.authorization ?? "";
     const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
     const pathToken = typeof req.params.token === "string" ? req.params.token : "";
     if ((bearer && tokensEqual(bearer, config.authToken)) || (pathToken && tokensEqual(pathToken, config.authToken))) {
-      return next();
+      return pass();
     }
     res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
   };
@@ -150,8 +169,10 @@ async function runHttp() {
     });
   };
 
+  // JSON is parsed only after auth, so unauthenticated requests can't make us parse 5 MB bodies.
+  const json = express.json({ limit: "5mb" });
   for (const path of ["/mcp", "/mcp/:token"]) {
-    app.post(path, auth, handle);
+    app.post(path, auth, json, handle);
     app.get(path, auth, methodNotAllowed);
     app.delete(path, auth, methodNotAllowed);
   }
