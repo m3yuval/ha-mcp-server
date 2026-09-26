@@ -84,7 +84,76 @@ function toRel(root: string, p: string) {
 }
 
 export function isDbFile(rel: string) {
-  return /\.db(-shm|-wal|-journal)?$/i.test(rel) || /\.sqlite3?$/i.test(rel);
+  // home-assistant_v2.db, *.db-wal, zigbee.db.backup, *.sqlite, ...
+  return /\.db($|[.-])/i.test(rel) || /\.sqlite3?($|[.-])/i.test(rel);
+}
+
+export function isLogFile(rel: string) {
+  return /\.log($|\.\d+$|\.old$|\.fault$|\.\d+\.gz$)/i.test(path.posix.basename(rel));
+}
+
+/**
+ * .storage files that may be READ (never written). Everything else in
+ * .storage (auth, auth_provider.*, onboarding, http, http.auth, cloud,
+ * homekit.*, application_credentials, core.restore_state, backup, ...) is
+ * refused and hidden. Names are Home Assistant STORAGE_KEY values.
+ */
+export const STORAGE_READABLE: readonly (string | RegExp)[] = [
+  "core.config",
+  "core.area_registry",
+  "core.device_registry",
+  "core.entity_registry",
+  "core.floor_registry",
+  "core.label_registry",
+  "core.category_registry",
+  "core.config_entries", // data/options/subentry data values are fully redacted
+  /^lovelace(\..+|_dashboards|_resources)?$/,
+  /^input_(boolean|button|datetime|number|select|text)$/,
+  "counter",
+  "timer",
+  "schedule",
+  "person",
+  "zone",
+  "energy",
+  "assist_pipeline.pipelines",
+];
+
+export function storageReadable(rel: string) {
+  if (!isStorage(rel) || rel === ".storage") return true;
+  const parts = rel.split("/");
+  if (parts.length !== 2) return false; // no sub-folders of .storage
+  const name = parts[1];
+  return STORAGE_READABLE.some((m) => (typeof m === "string" ? m === name : m.test(name)));
+}
+
+/**
+ * Files holding credentials or private keys: never read, written, deleted or
+ * restored by the file tools, and hidden from listings. Returns the reason, or
+ * null when the path is not sensitive. (.storage is handled separately by an
+ * allowlist; public certificates *.crt / *.pub stay readable.)
+ */
+export function sensitiveReason(rel: string): string | null {
+  const parts = rel.split("/");
+  const base = (parts[parts.length - 1] ?? "").toLowerCase();
+  if (parts.some((p) => p === ".ssh")) return "SSH keys and config (.ssh/)";
+  if (parts[0] === ".cloud") return "Home Assistant Cloud credentials (.cloud/)";
+  if (parts[0] === ".git" || base === ".git-credentials") return "git data (may hold credentials)";
+  if (/\.(pem|key|p12|pfx|jks|keystore|gpg)$/.test(base)) return "private key / keystore file";
+  if (/^id_[^.]*$/.test(base) || (/^id_(rsa|dsa|ecdsa|ed25519)/.test(base) && !base.endsWith(".pub"))) {
+    return "SSH private key";
+  }
+  if (/service[_-]?account.*\.json$/.test(base)) return "service account credentials";
+  if (/^client_secret.*\.json$/.test(base) || base === "credentials.json") return "OAuth client credentials";
+  if (base.endsWith(".token") || /token[_-]?cache/.test(base)) return "OAuth token file";
+  if (base === ".env" || base.endsWith(".env") || base === ".htpasswd" || base === ".netrc") return "credentials file";
+  if (isLogFile(base)) return "log file (may contain tokens; use ha_get_error_log for the Home Assistant log)";
+  if (isDbFile(base)) return "database file";
+  return null;
+}
+
+/** Files that hold only secret values: secrets.yaml (HA/ESPHome) and secret.yaml (Zigbee2MQTT). */
+export function isSecretStoreFile(rel: string) {
+  return /^secrets?\.ya?ml$/i.test(path.posix.basename(rel));
 }
 
 export function isSecretsFile(rel: string) {
@@ -102,8 +171,8 @@ export function isYaml(rel: string) {
 export function isTextLike(rel: string) {
   const ext = path.posix.extname(rel).toLowerCase();
   if (TEXT_EXTENSIONS.has(ext)) return true;
-  // .storage files have no extension but are JSON
-  return isStorage(rel) && ext === "";
+  // .storage files are JSON without a real extension (e.g. core.config_entries)
+  return isStorage(rel);
 }
 
 export class Sandbox {
@@ -195,11 +264,15 @@ export class Sandbox {
     if (first === BACKUP_DIR) {
       throw new HAError("Backups are not read directly. Use ha_list_config_backups / ha_restore_config_backup.");
     }
-    if (first === ".cloud") throw new HAError("Refusing to read .cloud/ (Home Assistant Cloud credentials)");
-    if (/^\.storage\/(auth|auth_provider\.|onboarding)/.test(rel)) {
-      throw new HAError(`Refusing to read ${rel} (authentication data)`);
-    }
     if (isDbFile(rel)) throw new HAError("Refusing to read database files");
+    const why = sensitiveReason(rel);
+    if (why) throw new HAError(`Refusing to read ${rel}: ${why}`);
+    if (!storageReadable(rel)) {
+      throw new HAError(
+        `Refusing to read ${rel}: only these .storage files are readable (the others hold credentials): ` +
+          STORAGE_READABLE.map((m) => (typeof m === "string" ? m : m.source)).join(", "),
+      );
+    }
     if (r.exists && r.isDir) throw new HAError(`${rel || "."} is a directory. Use ha_list_config_files.`);
     if (!r.exists) throw new HAError(`File not found: ${rel}`);
     if (!r.isFile) throw new HAError(`Not a regular file: ${rel}`);
@@ -225,7 +298,12 @@ export class Sandbox {
     if (first === BACKUP_DIR) throw new HAError("Backups can only be changed via ha_restore_config_backup");
     if (first === ".cloud" || first === "deps" || first === ".git") throw new HAError(`Refusing to write under ${first}/`);
     if (isDbFile(rel)) throw new HAError("Refusing to write database files");
-    if (/\.log(\.\d+|\.old|\.fault)?$/i.test(rel)) throw new HAError("Refusing to write log files");
+    if (isLogFile(rel)) throw new HAError("Refusing to write log files");
+    const why = sensitiveReason(rel);
+    if (why) throw new HAError(`Refusing to write ${rel}: ${why}`);
+    if (isSecretStoreFile(rel) && !isSecretsFile(rel)) {
+      throw new HAError(`Refusing to write ${rel}: it holds secret values, which must not pass through the file tools or diffs`);
+    }
     if (isSecretsFile(rel) && !opts.allowSecrets) {
       throw new HAError(
         "secrets.yaml cannot be written or edited with the generic file tools, so secret values never appear in arguments, logs or diffs. Use ha_set_secret / ha_delete_secret.",
@@ -275,30 +353,70 @@ export async function readText(abs: string): Promise<string> {
   return buf.toString("utf8");
 }
 
-/** Write via temp file + rename in the same directory. Creates parent dirs. */
-export async function atomicWrite(abs: string, content: string | Buffer, mode?: number) {
+/**
+ * Refuse unless `dir`'s real path is inside `root` (and equals `expected` when
+ * given). Called before mkdir, before creating the temp file and again right
+ * before the rename, so a directory swapped for a symlink in between (TOCTOU)
+ * is caught instead of writing outside the config dir.
+ */
+export async function assertRealDirInside(root: string, dir: string, expected?: string): Promise<string> {
+  let real: string;
+  try {
+    real = await fs.realpath(dir);
+  } catch (e: any) {
+    throw new HAError(`Cannot access ${dir}: ${e?.message ?? e}`);
+  }
+  if (!isInside(root, real) || (expected !== undefined && real !== expected)) {
+    throw new HAError(
+      "Refusing to write: the target folder changed (symlink?) and is no longer the checked location inside the config directory",
+    );
+  }
+  return real;
+}
+
+/** Nearest existing ancestor of p (p itself if it exists). */
+async function nearestExisting(p: string): Promise<string> {
+  let cur = p;
+  for (;;) {
+    if (await fs.lstat(cur).then(() => true, () => false)) return cur;
+    const up = path.dirname(cur);
+    if (up === cur) return cur;
+    cur = up;
+  }
+}
+
+/**
+ * Write via temp file + rename in the same directory. Creates parent dirs.
+ * With `root` (the real config dir), the parent directory is re-checked to
+ * still be the same real location inside root before mkdir, before the temp
+ * file is created (O_CREAT|O_EXCL|O_NOFOLLOW) and immediately before rename.
+ */
+export async function atomicWrite(abs: string, content: string | Buffer, mode?: number, root?: string) {
   const dir = path.dirname(abs);
+  if (root) await assertRealDirInside(root, await nearestExisting(dir));
   await fs.mkdir(dir, { recursive: true });
+  // `abs` comes from Sandbox.resolve (a real path), so its folder must resolve to itself.
+  if (root) await assertRealDirInside(root, dir, dir);
   const tmp = path.join(dir, `.${path.basename(abs)}.ha-mcp-tmp-${process.pid}-${randomBytes(4).toString("hex")}`);
   let prev: { uid: number; gid: number; mode: number } | undefined;
+  const lst = await fs.lstat(abs).catch(() => null);
+  if (lst?.isSymbolicLink()) throw new HAError("Refusing to write: the target became a symlink");
+  if (lst) prev = { uid: lst.uid, gid: lst.gid, mode: lst.mode & 0o777 };
+  const NOFOLLOW = (fsc as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
   try {
-    const st = await fs.stat(abs);
-    prev = { uid: st.uid, gid: st.gid, mode: st.mode & 0o777 };
-  } catch {
-    /* new file */
-  }
-  try {
-    const fh = await fs.open(tmp, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL, mode ?? prev?.mode ?? 0o644);
+    const fh = await fs.open(tmp, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | NOFOLLOW, mode ?? prev?.mode ?? 0o644);
     try {
       await fh.writeFile(content);
+      if (prev) {
+        // on the handle, not the path: nothing can be swapped under us
+        await fh.chmod(mode ?? prev.mode).catch(() => {});
+        await fh.chown(prev.uid, prev.gid).catch(() => {});
+      }
       await fh.sync();
     } finally {
       await fh.close();
     }
-    if (prev) {
-      await fs.chmod(tmp, mode ?? prev.mode).catch(() => {});
-      await fs.chown(tmp, prev.uid, prev.gid).catch(() => {});
-    }
+    if (root) await assertRealDirInside(root, dir, dir);
     await fs.rename(tmp, abs);
   } catch (e) {
     await fs.unlink(tmp).catch(() => {});
@@ -387,8 +505,8 @@ export async function listFiles(
       }
       if (!isFile) continue;
       if (e.name.includes(".ha-mcp-tmp-")) continue;
-      if (isDbFile(rel)) continue;
-      if (!opts.includeSystem && /\.log(\.\d+|\.old|\.fault)?$/i.test(e.name)) continue;
+      // Never list files the read tool refuses (credentials, keys, logs, databases, non-allowlisted .storage).
+      if (sensitiveReason(rel) || !storageReadable(rel)) continue;
       const wanted = opts.allText ? isTextLike(rel) : isYaml(rel);
       if (!wanted) continue;
       if (opts.match && !opts.match.test(opts.matchBasename ? e.name : rel)) continue;

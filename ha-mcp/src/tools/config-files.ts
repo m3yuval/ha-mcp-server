@@ -14,7 +14,15 @@
  *   - secrets.yaml values are never returned, diffed or accepted through the
  *     generic tools: use ha_set_secret / ha_delete_secret (the value argument
  *     is named secret_value so request logs redact it).
- *   - .storage/ JSON can be read (secret-looking keys redacted), never written.
+ *   - Credential files (.ssh/, private keys, service-account/OAuth JSON, token
+ *     files, .cloud/, logs, databases) are never read, written or listed
+ *     (sandbox.ts sensitiveReason).
+ *   - .storage/ is read-only and only an allowlist of files is readable
+ *     (sandbox.ts STORAGE_READABLE); core.config_entries data/options hidden.
+ *   - Every file read is redacted for display (config-files/redact.ts): values
+ *     of secret-looking keys and URL passwords become "**REDACTED**". Diffs are
+ *     computed between redacted views. Edits always act on the real file, and
+ *     writing the placeholder back is refused.
  */
 import { promises as fs } from "node:fs";
 import { createHash } from "node:crypto";
@@ -31,6 +39,7 @@ import {
   WRITABLE_EXTENSIONS,
   atomicWrite,
   globToRegExp,
+  isSecretStoreFile,
   isSecretsFile,
   isStorage,
   isYaml,
@@ -43,7 +52,6 @@ import {
   applyYamlOps,
   collectRefs,
   deleteSecret,
-  redactJson,
   redactSecretsYaml,
   secretNames,
   setSecret,
@@ -52,6 +60,17 @@ import {
   type Issue,
   type YamlOp,
 } from "./config-files/yaml-ha.js";
+import { REDACTED, redactForDisplay } from "./config-files/redact.js";
+
+function displayKind(rel: string): "storage" | "structured" | "text" {
+  if (isStorage(rel)) return "storage";
+  return isYaml(rel) || /\.json$/i.test(rel) ? "structured" : "text";
+}
+
+const REDACTION_NOTE =
+  `Values of secret-looking keys are shown as "${REDACTED}" (the file on disk is unchanged). ` +
+  `Edits apply to the real file: do not put "${REDACTED}" in old_string/new_string; ` +
+  "target those lines with yaml_operations, or keep secrets in secrets.yaml (ha_set_secret) and reference them with !secret.";
 
 /** Max characters of file content returned by one read (the response cap is 60k). */
 const READ_CHUNK_CHARS = 50_000;
@@ -202,11 +221,28 @@ export function registerConfigFileTools(ctx: ToolContext) {
       throw new HAError(`Refusing to write invalid ${isYaml(r.rel) ? "YAML" : "content"} to ${r.rel}: ${errs}. Fix it, or pass force=true to write anyway.`);
     }
     const oldText = oldBuf?.toString("utf8") ?? "";
+    // Writing the display placeholder back would silently destroy the real secret.
+    const count = (t: string) => t.split(REDACTED).length - 1;
+    if (count(newText) > count(oldText)) {
+      throw new HAError(`Refusing to write "${REDACTED}" into ${r.rel}: it is a display placeholder, not the real value. ${REDACTION_NOTE}`);
+    }
     const result: Record<string, unknown> = { path: r.rel };
     if (oldBuf && oldText === newText) {
       return { ...result, changed: false, note: "Content is identical; nothing written." };
     }
-    const diff = opts.secret ? undefined : unifiedDiff(oldText, newText, r.rel);
+    // The diff is computed between the REDACTED views of old and new content
+    // (line numbers are preserved by redaction), so it never shows secret values.
+    let diff: string | undefined;
+    let redactedKeys: string[] = [];
+    let secretOnlyChange = false;
+    if (!opts.secret) {
+      const kind = displayKind(r.rel);
+      const ro = redactForDisplay(kind, r.rel, oldText);
+      const rn = redactForDisplay(kind, r.rel, newText);
+      redactedKeys = [...new Set([...ro.keys, ...rn.keys])];
+      diff = unifiedDiff(ro.text, rn.text, r.rel);
+      secretOnlyChange = diff === "" && oldText !== newText;
+    }
     const summary = {
       ...result,
       action: oldBuf ? "updated" : "created",
@@ -214,11 +250,13 @@ export function registerConfigFileTools(ctx: ToolContext) {
       ...(validation.valid ? {} : { forced: true, errors: validation.errors }),
       ...(validation.warnings.length ? { warnings: validation.warnings } : {}),
       ...(diff !== undefined ? { diff_stats: diffStats(diff), diff } : {}),
+      ...(redactedKeys.length ? { redacted_keys: redactedKeys, redaction_note: "Secret values are masked in the diff." } : {}),
+      ...(secretOnlyChange ? { note_redacted_change: "Only redacted (secret) values or formatting inside them changed." } : {}),
     };
     if (opts.dryRun) return { ...summary, dry_run: true, note: "Preview only; nothing written." };
     let backup_id: string | undefined;
     if (oldBuf) backup_id = await (await backups()).save(r.rel, oldBuf);
-    await atomicWrite(r.abs, newText);
+    await atomicWrite(r.abs, newText, undefined, await sandbox.root());
     return {
       ...summary,
       ...(backup_id ? { backup_id } : {}),
@@ -289,8 +327,11 @@ export function registerConfigFileTools(ctx: ToolContext) {
         "Optional 1-based line range for big files. YAML files also get a parse check (errors with line numbers, " +
         "missing !include targets, undefined !secret names). Returns sha256 of the whole file; pass it as expected_sha256 " +
         "when writing to avoid overwriting concurrent changes. " +
-        "secrets.yaml: only key names are shown, values are replaced by ***. .storage/ files are JSON managed by Home Assistant: " +
-        "readable with secret-looking fields redacted, never writable.",
+        "secrets.yaml: only key names are shown, values are replaced by ***. In other files the values of secret-looking keys " +
+        `(password, token, api_key, private_key, network_key, webhook_id, ...) and passwords in URLs are shown as "${REDACTED}"; ` +
+        "redacted_keys lists them. Line numbers match the file on disk. .storage/: only registries, core.config, core.config_entries " +
+        "(data/options hidden), lovelace*, helpers, person, zone and energy are readable (read-only). " +
+        "Credential files (.ssh, keys/certs private parts, service accounts, tokens, .cloud, logs, databases) are refused.",
       inputSchema: {
         path: z.string().describe("File path relative to the config dir, e.g. 'automations.yaml'"),
         start_line: z.number().int().min(1).optional().describe("First line to return (1-based)"),
@@ -308,28 +349,41 @@ export function registerConfigFileTools(ctx: ToolContext) {
         modified: new Date(r.mtimeMs ?? 0).toISOString(),
       };
       let check: unknown;
-      if (isSecretsFile(r.rel)) {
+      if (isSecretStoreFile(r.rel)) {
+        // secrets.yaml (and Zigbee2MQTT's secret.yaml): every value is hidden.
         const red = redactSecretsYaml(text);
         if (!red) {
           const v = validate(r.rel, text);
-          return { ...meta, redacted: true, valid: false, errors: v.errors, note: "secrets.yaml does not parse; its content is not shown." };
+          return { ...meta, redacted: true, valid: false, errors: v.errors, note: `${path.posix.basename(r.rel)} does not parse; its content is not shown.` };
         }
         text = red.text;
         meta.redacted = true;
         meta.secret_names = red.names;
-        meta.note = "Values are hidden. Use ha_set_secret to add or change a secret.";
+        meta.note = isSecretsFile(r.rel)
+          ? "Values are hidden. Use ha_set_secret to add or change a secret."
+          : "Values are hidden. This file cannot be changed with the file tools.";
       } else if (isStorage(r.rel)) {
+        let red;
         try {
-          text = JSON.stringify(redactJson(JSON.parse(text)), null, 2) + "\n";
-          meta.redacted = true;
+          red = redactForDisplay("storage", r.rel, text);
         } catch {
           throw new HAError(`${r.rel} is not valid JSON; refusing to show it unredacted`);
         }
+        text = red.text;
+        meta.redacted = true;
+        if (red.keys.length) meta.redacted_keys = red.keys;
         meta.read_only = true;
-        meta.note = ".storage is managed by Home Assistant. Change these settings through the UI/API, not by editing the file.";
+        meta.note = ".storage is managed by Home Assistant. Change these settings through the UI/API, not by editing the file. Secret values are shown as " + JSON.stringify(REDACTED) + ".";
       } else {
         meta.sha256 = sha256(await fs.readFile(r.abs));
         if (isYaml(r.rel) || /\.json$/i.test(r.rel)) check = await fullValidation(r.rel, text);
+        const red = redactForDisplay(displayKind(r.rel), r.rel, text);
+        if (red.keys.length) {
+          text = red.text;
+          meta.redacted = true;
+          meta.redacted_keys = red.keys;
+          meta.note = REDACTION_NOTE;
+        }
       }
       const lines = text.split("\n");
       if (text.endsWith("\n")) lines.pop();
@@ -454,7 +508,10 @@ export function registerConfigFileTools(ctx: ToolContext) {
           text = out.text;
           replaced.push(out.count);
         } catch (e) {
-          throw new HAError(`replacements[${i}]: ${(e as Error).message}`);
+          const hint = (rep.old_string + rep.new_string).includes(REDACTED)
+            ? ` Note: "${REDACTED}" is only a display placeholder; the file contains the real value. ${REDACTION_NOTE}`
+            : "";
+          throw new HAError(`replacements[${i}]: ${(e as Error).message}${hint}`);
         }
       });
       if (ops.length) text = applyYamlOps(text, ops);
