@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { HAError } from "../../ha-client.js";
-import { DESTRUCTIVE, READ_ONLY, WRITE, defineTool, type ToolContext } from "../common.js";
+import { DESTRUCTIVE, READ_ONLY, defineTool, type ToolContext } from "../common.js";
 import { CAP, defined, matches, need, pathId, presentFlowStep, ws, type FlowKind } from "./util.js";
 
 interface ConfigEntry {
@@ -169,7 +169,9 @@ export function registerIntegrationTools(ctx: ToolContext) {
         flow_id: z.string().optional().describe("step/get/abort: the flow_id returned by start"),
         user_input: z.record(z.any()).optional().describe("step: field values, e.g. {\"host\": \"192.168.1.10\"}; menus: {\"next_step_id\": \"...\"}"),
       },
-      annotations: WRITE,
+      // Submitting steps creates integrations, reconfigures existing ones and
+      // applies repair fixes: it can disrupt or replace working setups.
+      annotations: DESTRUCTIVE,
     },
     async ({ action, flow, handler, entry_id, issue_id, flow_id, user_input }) => {
       const kind = flow as FlowKind;

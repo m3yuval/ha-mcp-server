@@ -149,7 +149,10 @@ export function registerHelperTools(ctx: ToolContext) {
         "- update: name, is_active, group_ids, local_only.\n" +
         "- set_password: set a new password for a user's login (password).\n" +
         "- delete: permanently delete the user. The owner and system-generated users can't be deleted.\n" +
-        "Only do this when the user explicitly asks; confirm the details with them first.",
+        "Accounts are the keys to the whole home: an admin (group 'system-admin') has full control of Home Assistant. " +
+        "create, set_password, delete, deactivating (is_active=false) and any group_ids change require confirm: true. " +
+        "Only do this when the user explicitly asks; confirm the exact details (and whether the account is an admin) with them first. " +
+        "Passwords are never returned or logged.",
       inputSchema: {
         action: z.enum(["create", "update", "set_password", "delete"]),
         user_id: z.string().optional().describe("update/set_password/delete"),
@@ -159,10 +162,31 @@ export function registerHelperTools(ctx: ToolContext) {
         group_ids: z.array(z.string()).optional().describe("'system-admin', 'system-users' or 'system-read-only'"),
         is_active: z.boolean().optional(),
         local_only: z.boolean().optional().describe("Can only log in from the local network"),
+        confirm: z
+          .boolean()
+          .optional()
+          .describe("Must be true for create, set_password, delete, deactivation and group changes. Ask the user first."),
       },
       annotations: DESTRUCTIVE,
     },
-    async ({ action, user_id, name, username, password, group_ids, is_active, local_only }) => {
+    async ({ action, user_id, name, username, password, group_ids, is_active, local_only, confirm }) => {
+      const sensitive =
+        action !== "update" || group_ids !== undefined || is_active === false;
+      if (sensitive && confirm !== true) {
+        const what =
+          action === "update"
+            ? group_ids !== undefined
+              ? `change the groups of user '${user_id ?? "?"}'${group_ids.includes("system-admin") ? " (granting administrator)" : ""}`
+              : `deactivate user '${user_id ?? "?"}'`
+            : action === "create"
+              ? `create ${group_ids?.includes("system-admin") ? "an ADMINISTRATOR account (full control of Home Assistant)" : "a user account"}`
+              : action === "set_password"
+                ? `set the password of user '${user_id ?? "?"}'`
+                : `delete user '${user_id ?? "?"}'`;
+        throw new HAError(
+          `Refusing to ${what} without confirm: true. Explain exactly what will change to the user, get their explicit approval, then call again with confirm: true.`,
+        );
+      }
       if (action === "create") {
         if ((username === undefined) !== (password === undefined)) {
           throw new HAError("Pass both username and password to create a login, or neither");
