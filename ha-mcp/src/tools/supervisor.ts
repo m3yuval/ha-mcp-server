@@ -12,8 +12,15 @@
  *   - Destroying/replacing data (uninstall, remove/restore backup, stop/restart
  *     core, host reboot/shutdown, remove repository, apply suggestion) needs
  *     confirm: true. Without it nothing is sent.
+ *   - Adding a store repository, installing an add-on and changing any add-on's
+ *     options also need confirm: true (third-party code / shell access).
+ *   - Option keys that run commands or install packages (init_commands etc.)
+ *     are refused unless allow_command_options: true: they give a shell from
+ *     which this add-on's own options could be changed.
  *   - This add-on never stops, restarts, updates, uninstalls or reconfigures
- *     itself (detected via GET /addons/self/info).
+ *     itself (detected via GET /addons/self/info), and never restores a backup
+ *     over itself unless include_this_addon: true. This self-protection is
+ *     best-effort: management is full admin access to Home Assistant.
  *   - Long operations (backup, restore, install, update) run in the
  *     Supervisor's background mode and return a job id for ha_get_job.
  */
@@ -21,11 +28,20 @@ import { z } from "zod";
 import { HAError } from "../ha-client.js";
 import { defineTool, DESTRUCTIVE, READ_ONLY, WRITE, type ToolContext } from "./common.js";
 
-// Supervisor slugs: RE_SLUG in supervisor/const.py is [-_.A-Za-z0-9]+.
-const SLUG = /^[-_.A-Za-z0-9]+$/;
+// Supervisor slugs: RE_SLUG in supervisor/const.py is [-_.A-Za-z0-9]+, but real
+// add-on / repository / backup slugs are lowercase alphanumerics with _ and -
+// (core_mosquitto, a0d7b954_ssh, local_xxx, 5c53de3b_esphome, 1a2b3c4d). The
+// stricter pattern rules out '.', '..' and '/' (path traversal in /addons/<slug>/...).
+const SLUG = /^[a-z0-9][a-z0-9_-]*$/;
 const HEX_ID = /^[a-f0-9]{8,64}$/i;
 const VERSION = /^[A-Za-z0-9][-_.+A-Za-z0-9]*$/;
-const SECRET_KEY = /token|password|passwd|secret|api_?key|authorization|credential/i;
+// "pass" covers password/passwd/passphrase, "key" covers api_key/private_key/psk key.
+// "pin" only as its own word (pin, wifi_pin, pincode) so ping/mapping stay visible.
+const SECRET_KEY = /token|pass|secret|key|authorization|credential|(^|[_-])pin(s|code)?($|[_-])|psk|private|webhook|cookie|salt/i;
+/** 'code' keys (alarm codes, door codes) are secret when they hold a short value. */
+const CODE_KEY = /code/i;
+/** Option keys that run commands or install software inside the add-on container. */
+const COMMAND_KEY = /init_command|command|script|exec|shell|packages/i;
 
 const BACKUP_FOLDERS = ["share", "addons/local", "ssl", "media"] as const;
 const DEFAULT_LOG_LINES = 100;
@@ -73,17 +89,97 @@ async function longOp<T>(what: string, followUp: string, fn: () => Promise<T>): 
   }
 }
 
+function isSecretKey(k: string, val: unknown) {
+  if (SECRET_KEY.test(k)) return true;
+  return CODE_KEY.test(k) && (typeof val === "number" || (typeof val === "string" && val.length <= 16));
+}
+
+const isPrimitive = (v: unknown) => v !== null && v !== undefined && v !== "" && typeof v !== "object";
+
 /** Mask values of secret-looking keys (for displaying add-on options). */
 function maskSecrets(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(maskSecrets);
   if (v && typeof v === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      out[k] = SECRET_KEY.test(k) && val !== null && val !== "" && typeof val !== "object" ? "***" : maskSecrets(val);
+      if (isPrimitive(val) && isSecretKey(k, val)) out[k] = "***";
+      else if (Array.isArray(val) && SECRET_KEY.test(k)) out[k] = val.map((x) => (isPrimitive(x) ? "***" : maskSecrets(x)));
+      else out[k] = maskSecrets(val);
     }
     return out;
   }
   return v;
+}
+
+/** All keys, and the values of secret-looking keys, in an options object. */
+function collectOptions(v: unknown, keys = new Set<string>(), secrets = new Set<string>(), secretParent = false) {
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      if (secretParent && isPrimitive(x)) secrets.add(String(x));
+      else collectOptions(x, keys, secrets);
+    }
+  } else if (v && typeof v === "object") {
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      keys.add(k);
+      if (isPrimitive(val) && isSecretKey(k, val)) secrets.add(String(val));
+      else collectOptions(val, keys, secrets, SECRET_KEY.test(k));
+    }
+  }
+  return { keys, secrets };
+}
+
+/**
+ * Supervisor option-validation messages (voluptuous humanize_error) echo the
+ * submitted values, e.g. "... @ data['password']. Got 'hunter2'". Keep option
+ * key names, mask anything that could be a value.
+ */
+function maskValidationMessage(msg: string, options: unknown, slug?: string): string {
+  const { keys, secrets } = collectOptions(options);
+  if (slug) keys.add(slug);
+  // Supervisor JSON envelope keys (HTTP errors quote the raw body).
+  for (const k of ["result", "error", "message", "data", "ok"]) keys.add(k);
+  let out = msg;
+  // HTTP errors quote the raw Supervisor body: keep just its message.
+  const body = out.match(/\{.*\}\s*$/s);
+  if (body) {
+    try {
+      const parsed = JSON.parse(body[0]);
+      if (typeof parsed?.message === "string") out = out.slice(0, body.index) + parsed.message;
+    } catch {
+      /* not JSON */
+    }
+  }
+  // Secret values anywhere in the message (longest first so no fragment survives).
+  for (const s of [...secrets].filter((x) => x.length >= 3).sort((a, b) => b.length - a.length)) {
+    out = out.split(s).join("***");
+  }
+  // voluptuous: "... Got <value>" up to the end of the line.
+  out = out.replace(/\bGot\b[^\n]*/g, "Got ***");
+  // Quoted tokens that are not option key names.
+  out = out.replace(/(['"])((?:(?!\1)[^\n])*)\1/g, (m, q: string, inner: string) => (keys.has(inner) ? m : `${q}***${q}`));
+  return out;
+}
+
+/** Dotted paths of command-like option keys whose value differs from `current`. */
+function changedCommandKeys(next: unknown, current: unknown, path = ""): string[] {
+  const out: string[] = [];
+  if (Array.isArray(next)) {
+    next.forEach((x, i) =>
+      out.push(...changedCommandKeys(x, Array.isArray(current) ? current[i] : undefined, `${path}[${i}]`)),
+    );
+    return out;
+  }
+  if (!next || typeof next !== "object") return out;
+  const cur = current && typeof current === "object" && !Array.isArray(current) ? (current as Record<string, unknown>) : {};
+  for (const [k, val] of Object.entries(next as Record<string, unknown>)) {
+    const p = path ? `${path}.${k}` : k;
+    if (COMMAND_KEY.test(k)) {
+      if (JSON.stringify(val) !== JSON.stringify(cur[k])) out.push(p);
+    } else {
+      out.push(...changedCommandKeys(val, cur[k], p));
+    }
+  }
+  return out;
 }
 
 function pick(obj: Record<string, any> | undefined, keys: string[]) {
@@ -336,10 +432,11 @@ export function registerSupervisorTools(ctx: ToolContext) {
     {
       title: "Start / stop / restart add-on",
       description:
-        "Start, stop or restart an installed add-on. Refuses to stop or restart this MCP add-on itself. " +
+        "Start, stop or restart an installed add-on. Stopping an add-on takes down what depends on it (e.g. MQTT, Zigbee, " +
+        "databases): check with the user. Refuses to stop or restart this MCP add-on itself. " +
         "Start/restart wait for the add-on to come up and may time out on slow add-ons while the Supervisor continues.",
       inputSchema: { slug: slugArg("add-on"), action: z.enum(["start", "stop", "restart"]) },
-      annotations: WRITE,
+      annotations: DESTRUCTIVE,
     },
     async ({ slug, action }) => {
       if (action !== "start") await assertNotSelf(slug, action);
@@ -357,15 +454,19 @@ export function registerSupervisorTools(ctx: ToolContext) {
       title: "Install add-on",
       description:
         "Install an add-on from the store (find slugs with ha_list_addons source=store; add third-party repositories with " +
-        "ha_store_repository). Runs in the background and returns a job id for ha_get_job. Installed add-ons get their own " +
-        "access to the system, so confirm the choice with the user.",
+        "ha_store_repository). An add-on is a container running its own code, often with broad access (host network, " +
+        "Home Assistant and Supervisor APIs, files, devices); a third-party add-on can run arbitrary code with that access. " +
+        "Requires confirm: true: tell the user what it is, who publishes it and what access it requests (ha_addon_info) first. " +
+        "Runs in the background and returns a job id for ha_get_job.",
       inputSchema: {
         slug: slugArg("add-on"),
         version: z.string().regex(VERSION).optional().describe("Specific version (default: latest)"),
+        confirm: confirmArg,
       },
       annotations: DESTRUCTIVE,
     },
-    async ({ slug, version }) => {
+    async ({ slug, version, confirm }) => {
+      requireConfirm({ confirm }, `install add-on '${slug}'`);
       const path = `/store/addons/${slug}/install${version ? `/${version}` : ""}`;
       const r = await longOp(`Install of '${slug}'`, "Check ha_get_job (no id: lists recent jobs) or ha_addon_info.", () =>
         sup("POST", path, { background: true }),
@@ -405,7 +506,10 @@ export function registerSupervisorTools(ctx: ToolContext) {
       description:
         "Change an add-on's configuration. options are merged into the current options (merge: false replaces them), " +
         "validated with the add-on's schema first (nothing is saved if invalid), then saved. Also sets boot/auto_update/watchdog. " +
-        "Options take effect after a restart (restart: true does it). Refuses to change this MCP add-on itself.",
+        "Options take effect after a restart (restart: true does it). Requires confirm: true. Refuses to change this MCP add-on itself. " +
+        "Options that run commands or install packages (keys like init_commands, packages, script, exec, shell, command) give " +
+        "shell access inside that add-on, from which Home Assistant and this add-on could be reconfigured: they are refused " +
+        "unless allow_command_options: true (plus confirm), only when the user explicitly asked for exactly that command.",
       inputSchema: {
         slug: slugArg("add-on"),
         options: z.record(z.unknown()).optional().describe("Add-on options (see ha_addon_info schema)"),
@@ -414,31 +518,63 @@ export function registerSupervisorTools(ctx: ToolContext) {
         auto_update: z.boolean().optional(),
         watchdog: z.boolean().optional(),
         restart: z.boolean().optional().describe("Restart the add-on afterwards to apply (default false)"),
+        allow_command_options: z
+          .boolean()
+          .optional()
+          .describe("Allow changing command/package options (init_commands, packages, ...). Only when the user explicitly asked."),
+        confirm: confirmArg,
       },
       annotations: DESTRUCTIVE,
     },
-    async ({ slug, options, merge, boot, auto_update, watchdog, restart }) => {
+    async ({ slug, options, merge, boot, auto_update, watchdog, restart, allow_command_options, confirm }) => {
       await assertNotSelf(slug, "change the options of");
+      requireConfirm({ confirm }, `change the options of add-on '${slug}'`);
       const body: Record<string, unknown> = {};
       if (options) {
         let next = options as Record<string, unknown>;
-        if (merge !== false) {
-          const info = await sup<Record<string, any>>("GET", `/addons/${slug}/info`);
-          next = { ...(info.options ?? {}), ...next };
+        let current: Record<string, unknown> | undefined;
+        const loadCurrent = async () =>
+          (current ??= (await sup<Record<string, any>>("GET", `/addons/${slug}/info`)).options ?? {});
+        if (merge !== false) next = { ...(await loadCurrent()), ...next };
+        // Only command keys whose value actually changes are refused (a full
+        // replace that repeats the current init_commands is fine).
+        if (allow_command_options !== true && changedCommandKeys(options, undefined).length) {
+          const changed = changedCommandKeys(next, await loadCurrent());
+          if (changed.length) {
+            throw new HAError(
+              `Refusing to change ${changed.join(", ")} of add-on '${slug}': options that run commands or install packages ` +
+                `give shell access inside that add-on, and from there Home Assistant and this MCP add-on itself could be ` +
+                `reconfigured. Nothing was saved. Only if the user explicitly asked for exactly this, show them the exact ` +
+                `value and call again with allow_command_options: true and confirm: true.`,
+            );
+          }
         }
-        const v = await sup<{ valid: boolean; message?: string; pwned?: boolean | null }>(
-          "POST",
-          `/addons/${slug}/options/validate`,
-          next,
-        );
-        if (!v?.valid) throw new HAError(`Options are invalid, nothing was saved: ${v?.message || "unknown validation error"}`);
+        const masked = (err: unknown, opts: unknown) =>
+          err instanceof HAError ? new HAError(maskValidationMessage(err.message, opts, slug), err.status) : err;
+        let v: { valid: boolean; message?: string; pwned?: boolean | null };
+        try {
+          v = await sup("POST", `/addons/${slug}/options/validate`, next);
+        } catch (err) {
+          throw masked(err, next);
+        }
+        if (!v?.valid) {
+          const msg = maskValidationMessage(v?.message || "unknown validation error", next, slug);
+          throw new HAError(`Options are invalid, nothing was saved: ${msg}`);
+        }
         body.options = next;
       }
       if (boot !== undefined) body.boot = boot;
       if (auto_update !== undefined) body.auto_update = auto_update;
       if (watchdog !== undefined) body.watchdog = watchdog;
       if (!Object.keys(body).length) throw new HAError("Nothing to change: pass options, boot, auto_update or watchdog");
-      await sup("POST", `/addons/${slug}/options`, body);
+      try {
+        await sup("POST", `/addons/${slug}/options`, body);
+      } catch (err) {
+        if (err instanceof HAError && body.options) {
+          throw new HAError(maskValidationMessage(err.message, body.options, slug), err.status);
+        }
+        throw err;
+      }
       if (restart) {
         const r = await longOp(`Restart of '${slug}'`, "Check its state with ha_addon_info.", () =>
           sup("POST", `/addons/${slug}/restart`),
@@ -457,8 +593,10 @@ export function registerSupervisorTools(ctx: ToolContext) {
       title: "Add / remove add-on repository",
       description:
         "Add a third-party add-on repository by URL (e.g. a GitHub repo URL), or remove one by slug (see ha_list_addons " +
-        "source=store). Third-party add-ons are not reviewed by Home Assistant: confirm with the user. Remove requires confirm: true " +
-        "and fails while add-ons from it are installed.",
+        "source=store). Third-party repositories are not reviewed by Home Assistant: their add-ons can run arbitrary code with " +
+        "broad access to the system (network, Home Assistant and Supervisor APIs, files), and the repository owner controls " +
+        "future updates. Both add and remove require confirm: true; tell the user whose repository it is first. Remove fails " +
+        "while add-ons from it are installed.",
       inputSchema: {
         action: z.enum(["add", "remove"]),
         repository: z.string().min(1).describe("add: repository URL; remove: repository slug"),
@@ -469,6 +607,7 @@ export function registerSupervisorTools(ctx: ToolContext) {
     async ({ action, repository, confirm }) => {
       if (action === "add") {
         if (!/^(https?:\/\/|git@)\S+$/.test(repository)) throw new HAError("repository must be a URL");
+        requireConfirm({ confirm }, `add third-party repository '${repository}'`);
         const r = await longOp(`Adding repository`, "Check ha_list_addons source=store.", () =>
           sup("POST", "/store/repositories", { repository }),
         );
@@ -572,12 +711,19 @@ export function registerSupervisorTools(ctx: ToolContext) {
       description:
         "Restore a backup, overwriting current data. Full restore by default (replaces Home Assistant config and all add-ons, " +
         "then restarts Home Assistant; this MCP server and its tools go offline for a while). Pass homeassistant/addons/folders " +
-        "for a partial restore. password is needed for protected backups. Requires confirm: true. Returns a job id.",
+        "for a partial restore. password is needed for protected backups. Requires confirm: true. Returns a job id. " +
+        "A full restore, or a partial one whose addons include this MCP add-on, also rolls back this add-on's own options " +
+        "and token (e.g. re-enabling capabilities the user turned off since): refused unless include_this_addon: true, " +
+        "which needs the user's explicit approval of exactly that. Prefer a partial restore without this add-on.",
       inputSchema: {
         slug: slugArg("backup"),
         password: z.string().min(1).optional(),
         ...partialShape,
         addons: z.array(slugArg("add-on")).optional().describe("Partial: add-on slugs to restore"),
+        include_this_addon: z
+          .boolean()
+          .optional()
+          .describe("Allow a restore that also restores this MCP add-on (full restore, or its slug in addons)"),
         confirm: confirmArg,
       },
       annotations: DESTRUCTIVE,
@@ -585,6 +731,29 @@ export function registerSupervisorTools(ctx: ToolContext) {
     async (args) => {
       requireConfirm(args, `restore backup '${args.slug}'`);
       const partial = args.homeassistant !== undefined || args.addons !== undefined || args.folders !== undefined;
+      if (args.include_this_addon !== true) {
+        const explain =
+          `That would also restore this MCP add-on, rolling back its own options and access token to the backup's ` +
+          `(e.g. re-enabling capabilities the user has since turned off). Nothing was sent. Do a partial restore ` +
+          `without this add-on, or, only if the user explicitly approves restoring this add-on too, call again with ` +
+          `include_this_addon: true and confirm: true.`;
+        if (!partial) throw new HAError(`Refusing a full restore of backup '${args.slug}'. ${explain}`);
+        const addons: string[] = Array.isArray(args.addons) ? args.addons : [];
+        if (addons.length) {
+          let own: string;
+          try {
+            own = await getSelfSlug();
+          } catch (err) {
+            throw new HAError(
+              `Refusing to restore add-ons from backup '${args.slug}': could not determine this add-on's own slug ` +
+                `(${(err as Error).message}). Pass include_this_addon: true only if the user approves restoring it too.`,
+            );
+          }
+          if (addons.some((a) => a === own || a === "self")) {
+            throw new HAError(`Refusing to restore add-on '${own}' from backup '${args.slug}'. ${explain}`);
+          }
+        }
+      }
       const body: Record<string, unknown> = { background: true };
       if (args.password !== undefined) body.password = args.password;
       if (partial) {
