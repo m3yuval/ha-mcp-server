@@ -159,7 +159,7 @@ export function registerReadTools(ctx: ToolContext) {
     {
       title: "List available actions (services)",
       description:
-        "List the actions (services) Home Assistant offers. Without a domain, returns every domain with its action names. With a domain, returns each action's description and fields. This is for discovery only — this server cannot run actions.",
+        "List the actions (services) Home Assistant offers. Without a domain, returns every domain with its action names. With a domain, returns each action's description and fields. Use it to discover what an action needs; running actions requires the separate action tools (only available when the add-on's actions capability is enabled).",
       inputSchema: {
         domain: z.string().optional().describe("Only this domain, e.g. 'light' or 'climate'"),
       },

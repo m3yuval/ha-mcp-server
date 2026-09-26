@@ -42,6 +42,7 @@ export const READ_ONLY_WS_COMMANDS = new Set([
   "repairs/list_issues",
   "recorder/info",
   "auth/current_user",
+  "homeassistant/expose_entity/list",
 ]);
 
 export class HAError extends Error {

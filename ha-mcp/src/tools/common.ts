@@ -57,6 +57,18 @@ function fail(err: unknown) {
   return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
 }
 
+/** Arguments that can hold whole file contents: logged as a size, never as text. */
+const BULKY_ARG_KEYS = new Set(["content", "replacements", "old_string", "new_string", "old_text", "new_text", "config"]);
+
+function argsForLog(args: unknown): unknown {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args as Record<string, unknown>)) {
+    out[k] = BULKY_ARG_KEYS.has(k) && v !== undefined ? `<${JSON.stringify(v)?.length ?? 0} chars>` : v;
+  }
+  return out;
+}
+
 /**
  * Register a tool. Every tool in this server MUST be registered through this
  * function: it logs each call (name, redacted args, duration, result) at INFO
@@ -74,11 +86,11 @@ export function defineTool<Shape extends ZodRawShape>(
     const started = Date.now();
     try {
       const result = await handler(args ?? {});
-      log.info(`tool ${name} ${summarize(args)} -> ok (${Date.now() - started}ms)`);
+      log.info(`tool ${name} ${summarize(argsForLog(args))} -> ok (${Date.now() - started}ms)`);
       return ok(result);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log.warning(`tool ${name} ${summarize(args)} -> error (${Date.now() - started}ms): ${msg.slice(0, 300)}`);
+      log.warning(`tool ${name} ${summarize(argsForLog(args))} -> error (${Date.now() - started}ms): ${msg.slice(0, 300)}`);
       return fail(err);
     }
   }) as any);

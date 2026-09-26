@@ -60,3 +60,45 @@ test("LOG_LEVEL=warning hides per-request INFO lines", async () => {
     await srv.stop();
   }
 });
+
+test("all capabilities on: every module registers together, no name clashes, write tools annotated", async () => {
+  const srv = await startMcp({
+    fake,
+    env: { ENABLE_ACTIONS: "true", ENABLE_CONFIG_FILES: "true", ENABLE_MANAGEMENT: "true", CONFIG_DIR: process.cwd() },
+  });
+  try {
+    const tools = await srv.tools();
+    const names = tools.map((t) => t.name);
+    assert.equal(new Set(names).size, names.length, "duplicate tool names");
+    assert.ok(names.length > 80, `expected the full tool set, got ${names.length}`);
+    for (const t of tools) {
+      assert.equal(typeof t.annotations?.readOnlyHint, "boolean", `${t.name} missing readOnlyHint`);
+      if (!t.annotations.readOnlyHint) assert.equal(typeof t.annotations.destructiveHint, "boolean", `${t.name} missing destructiveHint`);
+      assert.ok((t.description ?? "").length > 20, `${t.name} needs a real description`);
+    }
+    // Instructions tell Claude to confirm before changes
+    const info = srv.client.getInstructions();
+    assert.match(info, /get confirmation/);
+  } finally {
+    await srv.stop();
+  }
+});
+
+test("bulky arguments (file contents) are logged as a size, not as text", async () => {
+  const { mkdtemp, readFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "ha-mcp-log-"));
+  const srv = await startMcp({ fake, env: { ENABLE_CONFIG_FILES: "true", CONFIG_DIR: dir } });
+  try {
+    const r = await srv.call("ha_write_config_file", { path: "notes.yaml", content: "marker: SECRET-FILE-BODY\n" });
+    assert.ok(!r.isError, r.text);
+    assert.match(await readFile(join(dir, "notes.yaml"), "utf8"), /SECRET-FILE-BODY/);
+    await new Promise((r) => setTimeout(r, 150));
+    const out = srv.logs.join("");
+    assert.match(out, /tool ha_write_config_file .*"content":"<\d+ chars>"/);
+    assert.ok(!out.includes("SECRET-FILE-BODY"), out);
+  } finally {
+    await srv.stop();
+  }
+});
